@@ -100,9 +100,14 @@ is defined. Future extensions may add authenticated accounts, resume tokens and
 room recovery with fresh authorization; v1 clients must reject unknown versions.
 
 Production uses server-authenticated WSS with certificate validation. A reverse
-proxy may terminate TLS in front of the localhost WS server. TCP peer IP is the
-only abuse source identity; proxy headers are ignored. See README for finite
-resource/rate/deadline limits. STUN/TURN is separate from this protocol.
+proxy may terminate TLS in front of the localhost WS server. Abuse source identity
+defaults to the TCP peer IP. Only TCP peers in explicitly
+configured trusted-proxy CIDRs may supply one bounded `X-Forwarded-For` header.
+The chain is walked right-to-left from the trusted TCP peer and stops at the
+nearest untrusted hop; malformed, duplicate, missing or oversized trusted-proxy
+headers fail closed. IPv4-mapped IPv6 addresses are normalized. Untrusted peers
+cannot change source identity with headers; `Forwarded` and `X-Real-IP` are
+always ignored. See README for finite resource/rate/deadline limits. STUN/TURN is separate from this protocol.
 
 ## Canonical golden JSON
 
