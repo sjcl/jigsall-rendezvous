@@ -21,6 +21,7 @@ pub struct Limits {
     pub admissions_per_ip_per_minute: u32,
     pub room_attempts_per_ip_per_minute: u32,
     pub pending_timeout: Duration,
+    pub game_auth_timeout: Duration,
     pub idle_timeout: Duration,
     pub heartbeat_interval: Duration,
     pub heartbeat_timeout: Duration,
@@ -41,6 +42,7 @@ impl Default for Limits {
             admissions_per_ip_per_minute: 60,
             room_attempts_per_ip_per_minute: 120,
             pending_timeout: Duration::from_secs(12),
+            game_auth_timeout: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(15),
             heartbeat_timeout: Duration::from_secs(15),
@@ -85,6 +87,7 @@ impl Limits {
         }
         for d in [
             self.pending_timeout,
+            self.game_auth_timeout,
             self.idle_timeout,
             self.heartbeat_interval,
             self.heartbeat_timeout,
@@ -134,7 +137,8 @@ struct IpHistory {
 enum Membership {
     Host(RoomId),
     Pending(RoomId, JoinId),
-    Active(RoomId),
+    Routed(RoomId),
+    Established(RoomId),
 }
 pub(crate) struct Connection {
     tx: outbound::Sender,
@@ -152,6 +156,7 @@ struct Member {
     connection: u64,
     peer: PeerId,
     member: MemberId,
+    auth_deadline: Option<Instant>,
 }
 struct Pending {
     member: Member,
@@ -313,6 +318,12 @@ impl State {
                 self.join(id, room_code, peer_id, now)
             }
             ClientMessage::AuthorizeAck { join_id } => self.ack(id, join_id, now),
+            ClientMessage::ConfirmPeer { peer_id, member_id } => {
+                self.lifecycle(id, peer_id, member_id, false, now)
+            }
+            ClientMessage::RevokePeer { peer_id, member_id } => {
+                self.lifecycle(id, peer_id, member_id, true, now)
+            }
             ClientMessage::Signal {
                 to_peer_id,
                 payload_base64,
@@ -367,6 +378,7 @@ impl State {
             connection: id,
             peer,
             member: MemberId(random()),
+            auth_deadline: None,
         };
         self.rooms.insert(
             room,
@@ -416,6 +428,7 @@ impl State {
             connection: id,
             peer,
             member: MemberId(random()),
+            auth_deadline: None,
         };
         room.pending.insert(
             join,
@@ -454,14 +467,15 @@ impl State {
         if now >= pending.deadline {
             return Err(ErrorCode::JoinTimeout);
         }
-        let member = room.pending.remove(&join).unwrap().member;
+        let mut member = room.pending.remove(&join).unwrap().member;
+        member.auth_deadline = Some(now + self.limits.game_auth_timeout);
         let host = room.host;
         room.members.insert(member.peer, member);
         self.pending -= 1;
         self.connections
             .get_mut(&member.connection)
             .unwrap()
-            .membership = Some(Membership::Active(room_id));
+            .membership = Some(Membership::Routed(room_id));
         let mut e = Effects::default();
         // This ordering is a protocol contract. Server::transition serializes
         // the state commit and both enqueues against every competing relay.
@@ -486,6 +500,51 @@ impl State {
         e.deliveries.last_mut().unwrap().requires = Some(id);
         Ok(e)
     }
+    fn lifecycle(
+        &mut self,
+        id: u64,
+        peer: PeerId,
+        member_id: MemberId,
+        revoke: bool,
+        now: Instant,
+    ) -> Result<Effects, ErrorCode> {
+        let Some(Membership::Host(room_id)) = self.connections[&id].membership else {
+            return Err(ErrorCode::ProtocolViolation);
+        };
+        let member = *self.rooms[&room_id]
+            .members
+            .get(&peer)
+            .ok_or(ErrorCode::UnknownTarget)?;
+        if member.member != member_id {
+            return Err(ErrorCode::UnknownTarget);
+        }
+        let mut e = Effects::default();
+        if revoke || member.auth_deadline.is_some_and(|deadline| now >= deadline) {
+            if !revoke {
+                self.emit(
+                    &mut e,
+                    member.connection,
+                    ServerMessage::Error {
+                        code: ErrorCode::JoinTimeout,
+                    },
+                );
+            }
+            self.disconnect(member.connection, &mut e, now);
+        } else {
+            self.rooms
+                .get_mut(&room_id)
+                .unwrap()
+                .members
+                .get_mut(&peer)
+                .unwrap()
+                .auth_deadline = None;
+            self.connections
+                .get_mut(&member.connection)
+                .unwrap()
+                .membership = Some(Membership::Established(room_id));
+        }
+        Ok(e)
+    }
     fn signal(
         &mut self,
         id: u64,
@@ -499,11 +558,27 @@ impl State {
         }
         let (room_id, host) = match c.membership {
             Some(Membership::Host(room)) => (room, true),
-            Some(Membership::Active(room)) => (room, false),
+            Some(Membership::Routed(room) | Membership::Established(room)) => (room, false),
             _ => return Err(ErrorCode::NotInRoom),
         };
         let from = c.peer.unwrap();
         let room = &self.rooms[&room_id];
+        // Check the fixed authentication deadline even between sweeper ticks.
+        let participant = if host { to } else { from };
+        if let Some(member) = room.members.get(&participant).copied() {
+            if member.auth_deadline.is_some_and(|deadline| now >= deadline) {
+                let mut e = Effects::default();
+                self.emit(
+                    &mut e,
+                    member.connection,
+                    ServerMessage::Error {
+                        code: ErrorCode::JoinTimeout,
+                    },
+                );
+                self.disconnect(member.connection, &mut e, now);
+                return Ok(e);
+            }
+        }
         let target = if host {
             room.members.get(&to).ok_or(ErrorCode::UnknownTarget)?
         } else if to == room.host.peer {
@@ -576,7 +651,7 @@ impl State {
                     );
                 }
             }
-            Some(Membership::Active(room_id)) => {
+            Some(Membership::Routed(room_id) | Membership::Established(room_id)) => {
                 if let Some(room) = self.rooms.get_mut(&room_id) {
                     room.members.remove(&c.peer.unwrap());
                     let host = room.host.connection;
@@ -601,6 +676,13 @@ impl State {
     pub fn sweep(&mut self, now: Instant) -> Effects {
         let mut expired = Vec::new();
         for room in self.rooms.values() {
+            for member in room
+                .members
+                .values()
+                .filter(|m| m.auth_deadline.is_some_and(|deadline| now >= deadline))
+            {
+                expired.push((member.connection, ErrorCode::JoinTimeout));
+            }
             for p in room.pending.values().filter(|p| now >= p.deadline) {
                 expired.push((p.member.connection, ErrorCode::JoinTimeout));
             }

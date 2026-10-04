@@ -74,12 +74,20 @@ characters), normalize ASCII case, exclude I/L/O/U and retry collisions at most
 
 Joining reserves one slot and has a fixed 12-second deadline. The host receives
 AuthorizePeer, installs RouteOrigin/authorize_peer locally, then sends
-AuthorizeAck. Only this ACK promotes the joiner. The server enqueues PeerJoined
+AuthorizeAck. This ACK permits routing with a fixed 30-second game-auth deadline.
+The server enqueues PeerJoined
 to the host **before** RoomJoined to the joiner, within the same ordered
 transition. Both activation notifications precede subsequent signals to their
 socket. If the host notification cannot be queued, the joiner is not released. A
 pending participant cannot signal. Expiry/cancellation releases its identity and
 slot and informs the host with PeerUnavailable.
+
+After SPAKE2 reaches Authenticated, the host sends ConfirmPeer with the current
+PeerId and server-issued MemberId to establish the member and remove that deadline.
+Ready/image/baseline/catch-up are not prerequisites. Host RevokePeer releases a
+failed native/auth/bootstrap member immediately. Ping/Pong and signals do not
+renew the deadline. The server receives no password or PAKE data. This unreleased
+v1 extension requires updating the game and server together.
 
 MemberId is a **server-issued anonymous room membership**, not a Steam account
 or Sybil-proof user identity. New connections can obtain new memberships;
@@ -106,7 +114,7 @@ environment settings for capacities, IP guards and outbound byte budgets;
 | WebSocket reservations/connections | 1,024 global, 64 per resolved source IP |
 | Rooms | 256 |
 | Remote participants, including pending joins | 64 per room |
-| Pending joins | 512 global, within room participant limit |
+| Pending joins before host ACK | 512 global, within room participant limit |
 | WebSocket text message and individual frame | 24 KiB each; binary application frames rejected |
 | Decoded opaque signal | 1..=16 KiB; canonical padded standard Base64 |
 | Per-connection application messages | 256 per fixed 1-second window |
@@ -118,6 +126,7 @@ environment settings for capacities, IP guards and outbound byte budgets;
 | WebSocket read / write buffers | 24 KiB / 48 KiB maximum write buffer |
 | IP history | 4,096 entries, retained 5 minutes after use; never evict active IPs |
 | Pre-room idle / pending join | Fixed 30 / 12 seconds |
+| Routed member awaiting host game-auth confirmation | Fixed 30 seconds after ACK |
 | Ping interval / matching-Pong deadline | 15 / 15 seconds |
 | Network write / shutdown drain budget | 2 seconds per write / 2 seconds total drain per socket |
 | Room code allocation | At most 32 collision retries |

@@ -1,8 +1,40 @@
 use super::*;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
+mod auth;
 mod caps;
 mod ordering;
+#[test]
+fn silent_routed_members_cannot_permanently_fill_room() {
+    let mut h = Harness::new(Limits::default());
+    let host = h.connection(1);
+    let code = h.create(host, 1);
+    for peer in 2..=65 {
+        let client = h.connection(peer);
+        let join = h.pending(client, code.clone(), peer);
+        h.send(host, ClientMessage::AuthorizeAck { join_id: join });
+    }
+    let client = h.connection(66);
+    Harness::error(
+        h.send(
+            client,
+            ClientMessage::JoinRoom {
+                room_code: code.clone(),
+                peer_id: PeerId([66; 16]),
+            },
+        ),
+        ErrorCode::RoomFull,
+    );
+    h.now += Duration::from_secs(31);
+    h.state.sweep(h.now);
+    assert_eq!(
+        h.state.connections.len(),
+        1,
+        "all unauthenticated slots must expire"
+    );
+    let client = h.connection(67);
+    h.pending(client, code, 67);
+}
 struct Harness {
     state: State,
     now: Instant,

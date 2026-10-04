@@ -78,6 +78,111 @@ async fn send(socket: &mut Socket, message: ClientMessage) {
         .unwrap();
 }
 #[tokio::test]
+async fn ponging_routed_member_expires_but_confirmed_member_keeps_routing() {
+    for confirmed in [false, true] {
+        let f = Fixture::new(Limits {
+            participants: 1,
+            game_auth_timeout: Duration::from_millis(350),
+            heartbeat_interval: Duration::from_millis(40),
+            heartbeat_timeout: Duration::from_millis(200),
+            ..Limits::default()
+        })
+        .await;
+        let mut host = f.connect().await;
+        let mut joiner = f.connect().await;
+        send(
+            &mut host,
+            ClientMessage::CreateRoom {
+                peer_id: PeerId([1; 16]),
+            },
+        )
+        .await;
+        let ServerMessage::RoomCreated { room_code, .. } = receive(&mut host).await else {
+            panic!()
+        };
+        send(
+            &mut joiner,
+            ClientMessage::JoinRoom {
+                room_code: room_code.clone(),
+                peer_id: PeerId([2; 16]),
+            },
+        )
+        .await;
+        let ServerMessage::AuthorizePeer {
+            join_id, member_id, ..
+        } = receive(&mut host).await
+        else {
+            panic!()
+        };
+        send(&mut host, ClientMessage::AuthorizeAck { join_id }).await;
+        assert!(matches!(
+            receive(&mut host).await,
+            ServerMessage::PeerJoined { .. }
+        ));
+        assert!(matches!(
+            receive(&mut joiner).await,
+            ServerMessage::RoomJoined { .. }
+        ));
+        if confirmed {
+            send(
+                &mut host,
+                ClientMessage::ConfirmPeer {
+                    peer_id: PeerId([2; 16]),
+                    member_id,
+                },
+            )
+            .await;
+        }
+        // receive() flushes automatic Pongs; both sockets keep their heartbeat.
+        let (host_message, joiner_message) = tokio::join!(
+            timeout(Duration::from_millis(550), receive(&mut host)),
+            timeout(Duration::from_millis(550), receive(&mut joiner)),
+        );
+        if confirmed {
+            assert!(host_message.is_err() && joiner_message.is_err());
+            send(
+                &mut joiner,
+                ClientMessage::Signal {
+                    to_peer_id: PeerId([1; 16]),
+                    payload_base64: "AP8H".into(),
+                },
+            )
+            .await;
+            assert!(matches!(
+                receive(&mut host).await,
+                ServerMessage::Signal { .. }
+            ));
+        } else {
+            assert_eq!(
+                host_message.unwrap(),
+                ServerMessage::PeerUnavailable {
+                    peer_id: PeerId([2; 16])
+                }
+            );
+            assert_eq!(
+                joiner_message.unwrap(),
+                ServerMessage::Error {
+                    code: ErrorCode::JoinTimeout
+                }
+            );
+            let mut replacement = f.connect().await;
+            send(
+                &mut replacement,
+                ClientMessage::JoinRoom {
+                    room_code,
+                    peer_id: PeerId([3; 16]),
+                },
+            )
+            .await;
+            assert!(matches!(
+                receive(&mut host).await,
+                ServerMessage::AuthorizePeer { .. }
+            ));
+        }
+        f.shutdown().await;
+    }
+}
+#[tokio::test]
 async fn real_websocket_health_join_ack_opaque_relay_and_shutdown() {
     let f = Fixture::new(Limits::default()).await;
     let health = f

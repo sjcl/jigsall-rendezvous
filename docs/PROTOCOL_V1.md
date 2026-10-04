@@ -21,7 +21,8 @@ messages are each bounded at 24 KiB. WS Ping/Pong is outside the JSON schema.
 IDs are non-nil lowercase hyphenated UUID-shaped strings; noncanonical spellings
 are rejected. Random server IDs use UUID v4. Client PeerIds need not carry UUID
 version/variant bits; all nonzero 16-byte values have the same canonical encoding.
-Clients never supply RoomId, MemberId, AuthorityId or a signal sender identity.
+Clients never mint RoomId, MemberId, AuthorityId or a signal sender identity.
+Only the host echoes a server-issued MemberId in ConfirmPeer/RevokePeer.
 Room code is not a game authentication credential. MemberId has no account/Sybil
 guarantee; future account authentication can replace its use as RouteOrigin.account
 in an explicitly versioned extension. Current routing key is
@@ -36,7 +37,8 @@ in an explicitly versioned extension. Current routing key is
 4. Host adapter verifies its current room/authority, calls authorize_peer, then
    sends AuthorizeAck(join_id). ACK must originate from this room's host before
    the fixed 12-second deadline. A duplicate/stale/foreign ACK is rejected.
-5. Server commits the participant's active state, **enqueues PeerJoined to the
+5. Server commits the participant's Routed state with a fixed 30-second game-auth
+   deadline, **enqueues PeerJoined to the
    host first**, then **enqueues RoomJoined to the joiner**. The state commit and
    both nonblocking enqueues are one serialized transition: concurrent message
    handling, relays and cleanup cannot overtake them. Failed host enqueue closes
@@ -44,10 +46,29 @@ in an explicitly versioned extension. Current routing key is
    Joiner installs the host's route and only then emits
    HostReady to its caller. The caller may connect_peer; the adapter starts no
    password bootstrap or Sync/Ready.
-6. Signals travel only between this active host and an active participant.
+6. Signals travel only between this host and a Routed/Established participant.
    Participant-to-participant relay is protocol_violation. Targets outside the
    sender's room (including pending targets) are unknown_target. A pending sender
    is not_in_room. Sender PeerId is taken from server connection state.
+7. After SPAKE2 reaches Authenticated, the host sends ConfirmPeer(peer_id,
+   member_id). The exact current member becomes Established and loses its auth
+   deadline. Confirmation must precede expiry; it never resurrects a member.
+   Duplicate confirmation of the same Established member is idempotent.
+   Do not wait for Ready, image transfer, baseline or catch-up.
+8. On definitive ICE/authentication/bootstrap failure, the host sends
+   RevokePeer(peer_id, member_id), closing that member's control connection and
+   freeing its slot immediately. Both commands require the current room host
+   and exact member incarnation. Stale/foreign targets return unknown_target;
+   participant senders return protocol_violation. Hosts treat unknown_target
+   and join_timeout as nonfatal lifecycle races. No password, PAKE transcript
+   or game player identity is sent to this server.
+
+Pending has a fixed 12-second ACK deadline; Routed has a fixed 30-second game-auth
+deadline measured from ACK; Established has neither deadline. Ping/Pong, signals
+and repeated commands do not extend either deadline. Expired Routed sockets get
+join_timeout and close, and their host gets PeerUnavailable. Signaling and Confirm
+also check expiry between sweeper ticks. Global pending limits count pre-ACK joins;
+all three participant states count toward the room limit.
 
 The per-WebSocket FIFO contract is `PeerJoined → Signal` at the host and
 `RoomJoined → Signal` at the joiner, including when either peer signals immediately
@@ -63,6 +84,7 @@ SPAKE2 password protocol before any player or game state transition.
 ## Messages
 
 Client: create_room(peer_id), join_room(room_code, peer_id), authorize_ack(join_id),
+confirm_peer(peer_id, member_id), revoke_peer(peer_id, member_id),
 signal(to_peer_id, payload_base64), leave_room(). A socket belongs to at most one
 room. Duplicate PeerIds are rejected across live/pending memberships. LeaveRoom
 ends this control connection; create/join again requires a new connection.
@@ -83,10 +105,11 @@ Error codes: protocol_violation, unsupported_version, invalid_message,
 not_in_room, unknown_room, room_full, capacity, duplicate_peer, unknown_target,
 invalid_signal, signal_too_large, rate_limited, join_timeout, backpressure.
 Schema/framing violations close; operation rejection normally leaves the socket
-open for bounded retries. Pending expiry sends join_timeout and closes its
+open for bounded retries. Pending/Routed expiry sends join_timeout and closes its
 socket. Global admission rejection uses HTTP 429/503 before upgrade. A control
 queue overflow, write failure, frame-rate exhaustion or heartbeat expiry closes
-and cleans the connection. There is no game authentication status in this schema.
+and cleans the connection. ConfirmPeer is a host-reported lifecycle milestone;
+the server remains outside game authentication.
 
 ## Lifecycle, TLS and future extensions
 
