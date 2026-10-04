@@ -2,7 +2,10 @@ use futures_util::{SinkExt, StreamExt};
 use puzzella_rendezvous::{protocol::*, serve, Limits, Server};
 use std::time::Duration;
 use tokio::{net::TcpListener, sync::oneshot, time::timeout};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{client::IntoClientRequest, Error, Message},
+};
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 struct Fixture {
@@ -12,10 +15,13 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(limits: Limits) -> Self {
+        Self::with_server(Server::new(limits)).await
+    }
+    async fn with_server(server: Server) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stop, stopped) = oneshot::channel();
-        let task = tokio::spawn(serve(listener, Server::new(limits), async {
+        let task = tokio::spawn(serve(listener, server, async {
             let _ = stopped.await;
         }));
         Self {
@@ -25,12 +31,21 @@ impl Fixture {
         }
     }
     async fn connect(&self) -> Socket {
-        let (mut socket, _) = connect_async(&self.url).await.unwrap();
+        self.connect_from(None).await.unwrap()
+    }
+    async fn connect_from(&self, forwarded: Option<&str>) -> Result<Socket, Error> {
+        let mut request = self.url.clone().into_client_request().unwrap();
+        if let Some(ip) = forwarded {
+            request
+                .headers_mut()
+                .insert("x-forwarded-for", ip.parse().unwrap());
+        }
+        let (mut socket, _) = connect_async(request).await?;
         assert!(matches!(
             receive(&mut socket).await,
             ServerMessage::Welcome { .. }
         ));
-        socket
+        Ok(socket)
     }
     async fn shutdown(mut self) {
         let _ = self.stop.take().unwrap().send(());
@@ -179,4 +194,303 @@ async fn heartbeat_requires_matching_pong_even_with_incoming_text() {
     .await;
     assert!(closed.is_ok());
     f.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn immediate_joiner_and_host_signals_follow_their_activation_notifications() {
+    let f = Fixture::new(Limits::default()).await;
+    let mut host = f.connect().await;
+    send(
+        &mut host,
+        ClientMessage::CreateRoom {
+            peer_id: PeerId([1; 16]),
+        },
+    )
+    .await;
+    let ServerMessage::RoomCreated { room_code, .. } = receive(&mut host).await else {
+        panic!()
+    };
+    for n in 2..18 {
+        let mut joiner = f.connect().await;
+        send(
+            &mut joiner,
+            ClientMessage::JoinRoom {
+                room_code: room_code.clone(),
+                peer_id: PeerId([n; 16]),
+            },
+        )
+        .await;
+        let ServerMessage::AuthorizePeer { join_id, .. } = receive(&mut host).await else {
+            panic!()
+        };
+        send(&mut host, ClientMessage::AuthorizeAck { join_id }).await;
+        // Host does not consume PeerJoined until the joiner has signaled.
+        assert!(matches!(
+            receive(&mut joiner).await,
+            ServerMessage::RoomJoined { .. }
+        ));
+        send(
+            &mut joiner,
+            ClientMessage::Signal {
+                to_peer_id: PeerId([1; 16]),
+                payload_base64: "AP8H".into(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(receive(&mut host).await, ServerMessage::PeerJoined { peer_id, .. } if peer_id == PeerId([n; 16]))
+        );
+        assert!(
+            matches!(receive(&mut host).await, ServerMessage::Signal { from_peer_id, .. } if from_peer_id == PeerId([n; 16]))
+        );
+        send(&mut joiner, ClientMessage::LeaveRoom {}).await;
+        assert!(matches!(
+            receive(&mut host).await,
+            ServerMessage::PeerUnavailable { .. }
+        ));
+    }
+    // Also force the symmetric case: host signals immediately after PeerJoined,
+    // before the joiner reads its RoomJoined frame.
+    let mut joiner = f.connect().await;
+    send(
+        &mut joiner,
+        ClientMessage::JoinRoom {
+            room_code,
+            peer_id: PeerId([20; 16]),
+        },
+    )
+    .await;
+    let ServerMessage::AuthorizePeer { join_id, .. } = receive(&mut host).await else {
+        panic!()
+    };
+    send(&mut host, ClientMessage::AuthorizeAck { join_id }).await;
+    assert!(matches!(
+        receive(&mut host).await,
+        ServerMessage::PeerJoined { .. }
+    ));
+    send(
+        &mut host,
+        ClientMessage::Signal {
+            to_peer_id: PeerId([20; 16]),
+            payload_base64: "AP8H".into(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        receive(&mut joiner).await,
+        ServerMessage::RoomJoined { .. }
+    ));
+    assert!(matches!(
+        receive(&mut joiner).await,
+        ServerMessage::Signal { .. }
+    ));
+    f.shutdown().await;
+}
+
+fn rejected_status(error: Error) -> u16 {
+    let Error::Http(response) = error else {
+        panic!("expected HTTP rejection: {error}")
+    };
+    response.status().as_u16()
+}
+#[tokio::test]
+async fn only_trusted_proxy_headers_select_the_ip_guard() {
+    let limits = Limits {
+        connections_per_ip: 1,
+        ..Limits::default()
+    };
+    let f = Fixture::with_server(Server::with_trusted_proxies(
+        limits.clone(),
+        "127.0.0.1/32".parse().unwrap(),
+    ))
+    .await;
+    assert_eq!(
+        rejected_status(f.connect_from(None).await.unwrap_err()),
+        400
+    );
+    assert_eq!(
+        rejected_status(f.connect_from(Some("spoofed")).await.unwrap_err()),
+        400
+    );
+    let _a = f.connect_from(Some("198.51.100.1")).await.unwrap();
+    // A spoofed left prefix cannot get around the nearest untrusted client's cap.
+    assert_eq!(
+        rejected_status(
+            f.connect_from(Some("203.0.113.9, 198.51.100.1"))
+                .await
+                .unwrap_err()
+        ),
+        429
+    );
+    let _b = f.connect_from(Some("198.51.100.2")).await.unwrap();
+    f.shutdown().await;
+    let f = Fixture::new(limits).await;
+    let _a = f.connect_from(Some("198.51.100.1")).await.unwrap();
+    assert_eq!(
+        rejected_status(f.connect_from(Some("198.51.100.2")).await.unwrap_err()),
+        429
+    );
+    f.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_trusted_proxy_can_admit_a_full_64_remote_room() {
+    let f = Fixture::with_server(Server::with_trusted_proxies(
+        Limits::default(),
+        "127.0.0.1/32".parse().unwrap(),
+    ))
+    .await;
+    let mut host = f.connect_from(Some("198.51.100.1")).await.unwrap();
+    send(
+        &mut host,
+        ClientMessage::CreateRoom {
+            peer_id: PeerId([1; 16]),
+        },
+    )
+    .await;
+    let ServerMessage::RoomCreated { room_code, .. } = receive(&mut host).await else {
+        panic!()
+    };
+    let mut participants = Vec::new();
+    for n in 2..=65 {
+        let mut joiner = f
+            .connect_from(Some(&format!("198.51.100.{n}")))
+            .await
+            .unwrap();
+        send(
+            &mut joiner,
+            ClientMessage::JoinRoom {
+                room_code: room_code.clone(),
+                peer_id: PeerId([n; 16]),
+            },
+        )
+        .await;
+        let ServerMessage::AuthorizePeer { join_id, .. } = receive(&mut host).await else {
+            panic!()
+        };
+        send(&mut host, ClientMessage::AuthorizeAck { join_id }).await;
+        assert!(matches!(
+            receive(&mut host).await,
+            ServerMessage::PeerJoined { .. }
+        ));
+        assert!(matches!(
+            receive(&mut joiner).await,
+            ServerMessage::RoomJoined { .. }
+        ));
+        participants.push(joiner);
+    }
+    let mut excess = f.connect_from(Some("198.51.100.66")).await.unwrap();
+    send(
+        &mut excess,
+        ClientMessage::JoinRoom {
+            room_code,
+            peer_id: PeerId([66; 16]),
+        },
+    )
+    .await;
+    assert_eq!(
+        receive(&mut excess).await,
+        ServerMessage::Error {
+            code: ErrorCode::RoomFull
+        }
+    );
+    assert_eq!(participants.len(), 64);
+    f.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires real Caddy sample + backend with trusted loopback and per-IP cap 2"]
+async fn caddy_edge_replaces_spoofed_ip_and_relays_ordered_activation() {
+    let url = std::env::var("PUZZELLA_CADDY_SMOKE_URL").expect("loopback sample URL");
+    // This fixture deliberately uses HTTP/WS only on local loopback. Production
+    // runs the unmodified sample with a public domain and automatic HTTPS.
+    assert!(url.starts_with("ws://127.0.0.1:"));
+    let mut request = url.clone().into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("x-forwarded-for", "198.51.100.1".parse().unwrap());
+    let (mut host, _) = connect_async(request).await.unwrap();
+    assert!(matches!(
+        receive(&mut host).await,
+        ServerMessage::Welcome { .. }
+    ));
+    let mut request = url.clone().into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("x-forwarded-for", "203.0.113.2".parse().unwrap());
+    request
+        .headers_mut()
+        .insert("forwarded", "for=203.0.113.3".parse().unwrap());
+    let (mut joiner, _) = connect_async(request).await.unwrap();
+    assert!(matches!(
+        receive(&mut joiner).await,
+        ServerMessage::Welcome { .. }
+    ));
+    let mut request = url.clone().into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("x-forwarded-for", "192.0.2.3".parse().unwrap());
+    assert_eq!(
+        rejected_status(connect_async(request).await.unwrap_err()),
+        429
+    );
+    let base = url.replace("ws://", "http://").replace("/v1/ws", "");
+    assert_eq!(
+        reqwest::get(format!("{base}/healthz"))
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        reqwest::get(format!("{base}/not-a-route"))
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    send(
+        &mut host,
+        ClientMessage::CreateRoom {
+            peer_id: PeerId([1; 16]),
+        },
+    )
+    .await;
+    let ServerMessage::RoomCreated { room_code, .. } = receive(&mut host).await else {
+        panic!()
+    };
+    send(
+        &mut joiner,
+        ClientMessage::JoinRoom {
+            room_code,
+            peer_id: PeerId([2; 16]),
+        },
+    )
+    .await;
+    let ServerMessage::AuthorizePeer { join_id, .. } = receive(&mut host).await else {
+        panic!()
+    };
+    send(&mut host, ClientMessage::AuthorizeAck { join_id }).await;
+    assert!(matches!(
+        receive(&mut joiner).await,
+        ServerMessage::RoomJoined { .. }
+    ));
+    send(
+        &mut joiner,
+        ClientMessage::Signal {
+            to_peer_id: PeerId([1; 16]),
+            payload_base64: "AP8H".into(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        receive(&mut host).await,
+        ServerMessage::PeerJoined { .. }
+    ));
+    assert!(matches!(
+        receive(&mut host).await,
+        ServerMessage::Signal { .. }
+    ));
+    host.close(None).await.unwrap();
+    joiner.close(None).await.unwrap();
 }

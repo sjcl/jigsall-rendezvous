@@ -1,4 +1,4 @@
-use puzzella_rendezvous::{serve, Limits, Server};
+use puzzella_rendezvous::{serve, Config, Server};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Restrict logging to our own target. Dependency trace logs can include
@@ -12,12 +12,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing_subscriber::filter::Targets::new().with_target("puzzella_rendezvous", level),
         ))
         .init();
-    let address = std::env::var("PUZZELLA_RENDEZVOUS_LISTEN")
-        .unwrap_or_else(|_| "127.0.0.1:8080".into())
-        .parse::<std::net::SocketAddr>()?;
-    let listener = tokio::net::TcpListener::bind(address).await?;
+    let config = Config::from_env()?;
+    let server = Server::with_trusted_proxies(config.limits, config.trusted_proxies);
+    let listener = tokio::net::TcpListener::bind(config.listen).await?;
     tracing::info!(listen = %listener.local_addr()?, "rendezvous v1 listening");
-    serve(listener, Server::new(Limits::default()), async {
+    serve(listener, server, async {
         #[cfg(unix)]
         {
             let mut term =

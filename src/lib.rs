@@ -1,21 +1,27 @@
 //! Anonymous control-plane routing only. Gameplay authentication stays in SPAKE2.
+mod config;
+mod outbound;
 pub mod protocol;
+mod proxy;
 mod state;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         ConnectInfo, State,
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
 };
+pub use config::{Config, ConfigError};
 use futures_util::{SinkExt, StreamExt};
 use protocol::{ErrorCode, Frame, ServerMessage, MAX_WS_BYTES};
+pub use proxy::TrustedProxies;
 use state::Effects;
 pub use state::Limits;
 use std::{
+    collections::HashSet,
     future::Future,
     net::SocketAddr,
     sync::{Arc, Mutex},
@@ -32,12 +38,23 @@ pub struct Server {
     state: Arc<Mutex<state::State>>,
     permits: Arc<Semaphore>,
     limits: Limits,
+    trusted_proxies: TrustedProxies,
+    outbound_bytes: Arc<Semaphore>,
+    // State changes and their nonblocking enqueues form one ordered transition.
+    // This gate is never held during socket I/O or any await.
+    dispatch_gate: Arc<Mutex<()>>,
 }
 impl Server {
     pub fn new(limits: Limits) -> Self {
+        Self::with_trusted_proxies(limits, TrustedProxies::default())
+    }
+    pub fn with_trusted_proxies(limits: Limits, trusted_proxies: TrustedProxies) -> Self {
         Self {
             state: Arc::new(Mutex::new(state::State::new(limits.clone()))),
             permits: Arc::new(Semaphore::new(limits.connections)),
+            outbound_bytes: Arc::new(Semaphore::new(limits.outbound_bytes_global)),
+            dispatch_gate: Arc::new(Mutex::new(())),
+            trusted_proxies,
             limits,
         }
     }
@@ -47,12 +64,21 @@ impl Server {
             .route("/v1/ws", get(upgrade))
             .with_state(self.clone())
     }
-    // Clone senders during state mutation; send/try_send only after releasing
-    // the lock. Never await network I/O under this lock.
+    fn transition(&self, update: impl FnOnce(&mut state::State) -> Effects) {
+        let _gate = self.dispatch_gate.lock().unwrap();
+        let effects = update(&mut self.state.lock().unwrap());
+        // Drop the state lock before serializing/enqueueing. The dispatch gate
+        // keeps later transitions from overtaking activation or cleanup frames.
+        self.dispatch(effects);
+    }
+    // Called only within transition. No network send or await occurs here.
     fn dispatch(&self, mut e: Effects) {
         loop {
-            let mut failed = Vec::new();
+            let mut failed = HashSet::new();
             for delivery in e.deliveries.drain(..) {
+                if delivery.requires.is_some_and(|id| failed.contains(&id)) {
+                    continue;
+                }
                 if delivery.tx.try_send(delivery.message).is_err() {
                     if let Some(source) = delivery.source {
                         let reply = self
@@ -62,11 +88,11 @@ impl Server {
                             .error(source, ErrorCode::Backpressure);
                         for d in reply.deliveries {
                             if d.tx.try_send(d.message).is_err() {
-                                failed.push(source);
+                                failed.insert(source);
                             }
                         }
                     } else {
-                        failed.push(delivery.target);
+                        failed.insert(delivery.target);
                     }
                 }
             }
@@ -83,8 +109,7 @@ impl Server {
         }
     }
     pub fn shutdown(&self) {
-        let effects = self.state.lock().unwrap().shutdown(Instant::now());
-        self.dispatch(effects);
+        self.transition(|state| state.shutdown(Instant::now()));
     }
 }
 struct Lease {
@@ -95,29 +120,35 @@ struct Lease {
 impl Drop for Lease {
     fn drop(&mut self) {
         let mut e = Effects::default();
-        self.server
-            .state
-            .lock()
-            .unwrap()
-            .disconnect(self.id, &mut e, Instant::now());
-        self.server.dispatch(e);
+        self.server.transition(|state| {
+            state.disconnect(self.id, &mut e, Instant::now());
+            e
+        });
     }
 }
 async fn upgrade(
     State(server): State<Server>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    let Ok(ip) = server.trusted_proxies.source(peer.ip(), &headers) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
     let Ok(permit) = server.permits.clone().try_acquire_owned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let (tx, rx) = mpsc::channel(server.limits.outbound);
+    let (tx, rx) = outbound::channel(
+        server.limits.outbound,
+        server.limits.outbound_bytes_per_connection,
+        server.outbound_bytes.clone(),
+    );
     let (cancel, cancelled) = watch::channel(false);
     let admitted = server
         .state
         .lock()
         .unwrap()
-        .admit(peer.ip(), tx, cancel, Instant::now());
+        .admit(ip, tx, cancel, Instant::now());
     let Ok(id) = admitted else {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     };
@@ -138,12 +169,11 @@ async fn upgrade(
 async fn session(
     socket: WebSocket,
     lease: Lease,
-    mut outbound: mpsc::Receiver<ServerMessage>,
+    mut outbound: mpsc::Receiver<outbound::Packet>,
     mut cancelled: watch::Receiver<bool>,
 ) {
     let server = &lease.server;
-    let welcome = server.state.lock().unwrap().welcome(lease.id);
-    server.dispatch(welcome);
+    server.transition(|state| state.welcome(lease.id));
     let (mut sink, mut stream) = socket.split();
     let limits = &server.limits;
     let mut heartbeat = tokio::time::interval_at(
@@ -179,8 +209,7 @@ async fn session(
                     Some(Ok(Message::Text(text))) => {
                         match protocol::parse_client(&text) {
                             Ok(message) => {
-                                let e = server.state.lock().unwrap().handle(lease.id, message, Instant::now());
-                                server.dispatch(e);
+                                server.transition(|state| state.handle(lease.id, message, Instant::now()));
                             }
                             Err(code) => {
                                 let json = serde_json::to_string(&Frame::new(ServerMessage::Error { code })).unwrap();
@@ -203,16 +232,20 @@ async fn session(
                 }
             }
             Some(message) = outbound.recv() => {
-                let json = serde_json::to_string(&Frame::new(message)).unwrap();
-                if !matches!(timeout(limits.write_timeout, sink.send(Message::Text(json.into()))).await, Ok(Ok(()))) { break; }
+                let outbound::Packet { text, reservation } = message;
+                let sent = timeout(limits.write_timeout, sink.send(Message::Text(text))).await;
+                drop(reservation);
+                if !matches!(sent, Ok(Ok(()))) { break; }
             }
         }
     }
     // A bounded grace budget for RoomClosed/errors already queued by cleanup.
     let _ = timeout(limits.write_timeout, async {
         while let Ok(message) = outbound.try_recv() {
-            let json = serde_json::to_string(&Frame::new(message)).unwrap();
-            if sink.send(Message::Text(json.into())).await.is_err() {
+            let outbound::Packet { text, reservation } = message;
+            let sent = sink.send(Message::Text(text)).await;
+            drop(reservation);
+            if sent.is_err() {
                 break;
             }
         }
@@ -233,8 +266,7 @@ pub async fn serve(
             tokio::select! {
                 _ = stopped.changed() => break,
                 _ = tick.tick() => {
-                    let e = maintenance.state.lock().unwrap().sweep(Instant::now());
-                    maintenance.dispatch(e);
+                    maintenance.transition(|state| state.sweep(Instant::now()));
                 }
             }
         }

@@ -11,7 +11,7 @@ fn global_pending_connection_and_cross_room_caps() {
     let a = h.connection(3);
     let b = h.connection(4);
     let idle = h.connection(5);
-    let (tx, _) = mpsc::channel(1);
+    let (tx, _) = h.queue();
     let (cancel, _) = watch::channel(false);
     assert_eq!(
         h.state
@@ -81,7 +81,7 @@ fn ip_attempt_history_survives_membership_churn() {
         let c = h.connection(1);
         h.state.disconnect(c, &mut Effects::default(), h.now);
     }
-    let (tx, _) = mpsc::channel(1);
+    let (tx, _) = h.queue();
     let (cancel, _) = watch::channel(false);
     assert_eq!(
         h.state

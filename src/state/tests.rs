@@ -1,20 +1,25 @@
 use super::*;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Semaphore};
 mod caps;
+mod ordering;
 struct Harness {
     state: State,
     now: Instant,
-    receivers: HashMap<u64, mpsc::Receiver<ServerMessage>>,
+    receivers: HashMap<u64, mpsc::Receiver<outbound::Packet>>,
+    outbound_bytes: Arc<Semaphore>,
 }
 impl Harness {
     fn new(limits: Limits) -> Self {
         Self {
+            outbound_bytes: Arc::new(Semaphore::new(limits.outbound_bytes_global)),
             state: State::new(limits),
             now: Instant::now(),
             receivers: HashMap::new(),
         }
     }
     fn connection(&mut self, ip: u8) -> u64 {
-        let (tx, rx) = mpsc::channel(self.state.limits.outbound);
+        let (tx, rx) = self.queue();
         let (cancel, _) = watch::channel(false);
         let id = self
             .state
@@ -22,6 +27,13 @@ impl Harness {
             .unwrap();
         self.receivers.insert(id, rx);
         id
+    }
+    fn queue(&self) -> (outbound::Sender, mpsc::Receiver<outbound::Packet>) {
+        outbound::channel(
+            self.state.limits.outbound,
+            self.state.limits.outbound_bytes_per_connection,
+            self.outbound_bytes.clone(),
+        )
     }
     fn send(&mut self, id: u64, message: ClientMessage) -> Effects {
         self.state.handle(id, message, self.now)
@@ -80,13 +92,15 @@ fn host_ack_gates_activation_and_authoritative_star_relay() {
     let e = h.send(host, ClientMessage::AuthorizeAck { join_id: join });
     assert!(matches!(
         e.deliveries[0].message,
-        ServerMessage::RoomJoined { .. }
-    ));
-    assert_eq!(e.deliveries[0].target, a);
-    assert!(matches!(
-        e.deliveries[1].message,
         ServerMessage::PeerJoined { .. }
     ));
+    assert_eq!(e.deliveries[0].target, host);
+    assert!(matches!(
+        e.deliveries[1].message,
+        ServerMessage::RoomJoined { .. }
+    ));
+    assert_eq!(e.deliveries[1].target, a);
+    assert_eq!(e.deliveries[1].requires, Some(host));
     let join = h.pending(b, code, 3);
     h.send(host, ClientMessage::AuthorizeAck { join_id: join });
     for (from, to, sender_peer) in [(host, 2, 1), (a, 1, 2)] {
@@ -253,7 +267,7 @@ fn rates_global_caps_and_bounded_ip_history() {
     );
     let mut e = Effects::default();
     h.state.disconnect(a, &mut e, h.now);
-    let (tx, _) = mpsc::channel(1);
+    let (tx, _) = h.queue();
     let (cancel, _) = watch::channel(false);
     assert_eq!(
         h.state.admit(
@@ -346,28 +360,18 @@ fn slow_signal_consumer_keeps_host_alive_and_cleanup_controls_are_bounded() {
     let code = h.create(host, 1);
     let join = h.pending(a, code, 2);
     h.send(host, ClientMessage::AuthorizeAck { join_id: join });
-    let server = crate::Server {
-        state: std::sync::Arc::new(std::sync::Mutex::new(h.state)),
-        permits: std::sync::Arc::new(tokio::sync::Semaphore::new(1024)),
-        limits: Limits::default(),
-    };
-    let e = server.state.lock().unwrap().welcome(host);
-    server.dispatch(e);
-    let e = server
-        .state
-        .lock()
-        .unwrap()
-        .handle(a, Harness::signal(1), h.now);
-    server.dispatch(e);
+    let server = crate::Server::new(h.state.limits.clone());
+    *server.state.lock().unwrap() = h.state;
+    server.transition(|state| state.welcome(host));
+    server.transition(|state| state.handle(a, Harness::signal(1), h.now));
     assert!(server.state.lock().unwrap().connections.contains_key(&host));
     assert_eq!(
-        h.receivers.get_mut(&a).unwrap().try_recv().unwrap(),
+        parse_server(&h.receivers.get_mut(&a).unwrap().try_recv().unwrap().text).unwrap(),
         ServerMessage::Error {
             code: ErrorCode::Backpressure
         }
     );
-    let e = server.state.lock().unwrap().welcome(host);
-    server.dispatch(e);
+    server.transition(|state| state.welcome(host));
     assert!(!server.state.lock().unwrap().connections.contains_key(&host));
     assert!(server.state.lock().unwrap().rooms.is_empty());
 }

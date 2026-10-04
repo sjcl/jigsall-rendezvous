@@ -38,13 +38,19 @@ Its explicit local test constructor accepts `ws://` only for literal loopback IP
 Route bindings are trusted only because they arrive on this authenticated server
 channel. They certify anonymous membership, never the game password.
 
-The server uses only the **TCP peer IP**. It ignores `X-Forwarded-For`, `Forwarded`
-and all similar headers; v1 has no trusted-proxy configuration. Behind a local
-proxy all clients share the proxy's IP guard. Configure connection/admission
-limits at the proxy for real source IPs; account for the backend's aggregate
-64-connections-per-IP limit. Restrict HTTP connection count, header/upgrade
-timeouts and request rate at the proxy too. HTTP sockets before an accepted
-WebSocket upgrade are outside the application's WebSocket connection cap.
+By default the server uses the **TCP peer IP** and ignores forwarding headers.
+For a reverse proxy, set `PUZZELLA_RENDEZVOUS_TRUSTED_PROXIES` to a comma-separated
+list of explicit proxy CIDRs, e.g. `127.0.0.1/32,::1/128`. Only connections from
+those addresses use `X-Forwarded-For` for all IP connection/admission/room-attempt
+guards. Read [deployment and configuration](docs/DEPLOYMENT.md) for validation,
+proxy chains and the trust boundary. `Forwarded` and `X-Real-IP` are never used.
+
+[deploy/Caddyfile](deploy/Caddyfile) and
+[deploy/rendezvous.env.example](deploy/rendezvous.env.example) provide a direct
+Internet-edge WSS configuration with a private localhost backend. In this setup
+the 64-per-IP guard applies to **each client IP**, so the proxy no longer imposes
+an aggregate 64-client ceiling. HTTP sockets before an accepted upgrade remain
+outside the application's WebSocket cap; the deployment guide covers edge limits.
 
 ## Room lifecycle
 
@@ -55,7 +61,10 @@ characters), normalize ASCII case, exclude I/L/O/U and retry collisions at most
 
 Joining reserves one slot and has a fixed 12-second deadline. The host receives
 AuthorizePeer, installs RouteOrigin/authorize_peer locally, then sends
-AuthorizeAck. Only this ACK promotes the joiner and delivers RoomJoined. A
+AuthorizeAck. Only this ACK promotes the joiner. The server enqueues PeerJoined
+to the host **before** RoomJoined to the joiner, within the same ordered
+transition. Both activation notifications precede subsequent signals to their
+socket. If the host notification cannot be queued, the joiner is not released. A
 pending participant cannot signal. Expiry/cancellation releases its identity and
 slot and informs the host with PeerUnavailable.
 
@@ -75,12 +84,13 @@ host reconnect or persistence.
 
 ## Resource and rate limits
 
-All application state and channels are bounded. Defaults (the library `Limits`
-can lower caps for deployment/testing):
+All application state and channels are bounded. The binary accepts validated
+environment settings for capacities, IP guards and outbound byte budgets;
+[DEPLOYMENT.md](docs/DEPLOYMENT.md) lists defaults and hard ceilings. Defaults:
 
 | Resource | Limit |
 | --- | --- |
-| WebSocket reservations/connections | 1,024 global, 64 per TCP source IP |
+| WebSocket reservations/connections | 1,024 global, 64 per resolved source IP |
 | Rooms | 256 |
 | Remote participants, including pending joins | 64 per room |
 | Pending joins | 512 global, within room participant limit |
@@ -91,7 +101,7 @@ can lower caps for deployment/testing):
 | All incoming frames (including Ping/Pong) | 512 per fixed 1-second window |
 | Create/join attempts | 4/10 seconds per connection, 120/minute per IP |
 | New connection attempts | 60/minute per IP |
-| Outbound WebSocket queue | 128 messages per connection |
+| Outbound WebSocket queue | 128 messages and 256 KiB per connection; 32 MiB global |
 | WebSocket read / write buffers | 24 KiB / 48 KiB maximum write buffer |
 | IP history | 4,096 entries, retained 5 minutes after use; never evict active IPs |
 | Pre-room idle / pending join | Fixed 30 / 12 seconds |
@@ -104,7 +114,13 @@ Only a matching Pong satisfies an outstanding heartbeat. Fixed rate windows can
 permit a burst across a window boundary; queues and byte limits remain finite.
 Signal congestion returns Backpressure to the source without kicking the host
 for a participant flood. A full control queue or expired writer closes that
-control connection. No lock is held over network I/O. Payloads are decoded only
+control connection. Byte reservations cover serialized UTF-8 for **all** queued
+application frames and remain held during socket writes. Failed enqueue, write
+completion/cancellation and queue destruction return both per-socket and global
+bytes automatically. These caps bound the outbound allocations, not the entire
+process: WebSocket/TCP buffers, incoming frames and bounded state are additional.
+State changes and nonblocking enqueues are serialized, with no lock over network
+I/O. Payloads are decoded only
 for validation and are never interpreted as GNS/game messages.
 
 ## Logging and shutdown
@@ -138,6 +154,10 @@ Tests use only local state and loopback sockets: host/ACK/join/opaque relay,
 star topology, spoofing, unknown room/target, duplicate peers, capacity, malformed
 and oversized signals, frame/version rejection, fixed deadlines, disconnect and
 shutdown cleanup, bounded slow consumers, rate/IP history and code collisions.
+Regression tests force the activation commit/enqueue gap with competing threads,
+immediate signals on both sockets, failed host activation enqueue, local/global
+byte saturation and reservation release. Real WebSocket tests check trusted and
+untrusted headers and admit a full 64-remote room through one loopback proxy IP.
 Both repositories parse and round-trip the same
 [golden messages](tests/fixtures/protocol_v1.jsonl). Update schema, these fixtures
 and the Puzzella copy together.

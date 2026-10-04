@@ -36,8 +36,12 @@ in an explicitly versioned extension. Current routing key is
 4. Host adapter verifies its current room/authority, calls authorize_peer, then
    sends AuthorizeAck(join_id). ACK must originate from this room's host before
    the fixed 12-second deadline. A duplicate/stale/foreign ACK is rejected.
-5. Server promotes the participant and returns RoomJoined to the joiner and
-   PeerJoined to the host. Joiner installs the host's route and only then emits
+5. Server commits the participant's active state, **enqueues PeerJoined to the
+   host first**, then **enqueues RoomJoined to the joiner**. The state commit and
+   both nonblocking enqueues are one serialized transition: concurrent message
+   handling, relays and cleanup cannot overtake them. Failed host enqueue closes
+   that control plane/room and never releases the joiner with RoomJoined.
+   Joiner installs the host's route and only then emits
    HostReady to its caller. The caller may connect_peer; the adapter starts no
    password bootstrap or Sync/Ready.
 6. Signals travel only between this active host and an active participant.
@@ -45,7 +49,12 @@ in an explicitly versioned extension. Current routing key is
    sender's room (including pending targets) are unknown_target. A pending sender
    is not_in_room. Sender PeerId is taken from server connection state.
 
-This ordering prevents Joiner signaling from arriving before host authorization.
+The per-WebSocket FIFO contract is `PeerJoined → Signal` at the host and
+`RoomJoined → Signal` at the joiner, including when either peer signals immediately
+after its notification. Cross-socket network delivery order is not assumed.
+This ordering prevents signaling before route authorization **and activation**.
+Clients may fail closed if an authenticated server violates this contract;
+pending routes must not be activated implicitly by a Signal.
 Host adapter does not advertise a peer to its caller until PeerJoined confirms
 activation. The client uses new_routed and never derives identities from opaque
 GNS payloads. Subsequent Connected still requires the existing SecureTransport /

@@ -1,0 +1,34 @@
+# Direct Internet edge: clients connect directly to this Caddy instance.
+# Set RENDEZVOUS_DOMAIN to a DNS name pointing at this machine.
+{
+	servers {
+		max_header_size 16KiB
+		timeouts {
+			read_header 5s
+			read_body 10s
+			idle 2m
+		}
+	}
+}
+
+{$RENDEZVOUS_DOMAIN:rendezvous.example.com} {
+	@rendezvous {
+		method GET
+		path /v1/ws /healthz
+	}
+	handle @rendezvous {
+		reverse_proxy 127.0.0.1:8080 {
+			# Default Caddy X-Forwarded-For uses the TCP client IP and ignores
+			# untrusted incoming values. Do not add trusted_proxies at this edge.
+			header_up -Forwarded
+			header_up -X-Real-IP
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 5s
+			}
+		}
+	}
+	handle {
+		respond 404
+	}
+}

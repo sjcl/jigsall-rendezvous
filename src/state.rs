@@ -1,10 +1,11 @@
+use crate::outbound;
 use crate::protocol::*;
 use std::{
     collections::HashMap,
     net::IpAddr,
     time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
 #[derive(Clone, Debug)]
 pub struct Limits {
@@ -13,8 +14,12 @@ pub struct Limits {
     pub participants: usize,
     pub pending: usize,
     pub outbound: usize,
+    pub outbound_bytes_per_connection: usize,
+    pub outbound_bytes_global: usize,
     pub ip_history: usize,
     pub connections_per_ip: usize,
+    pub admissions_per_ip_per_minute: u32,
+    pub room_attempts_per_ip_per_minute: u32,
     pub pending_timeout: Duration,
     pub idle_timeout: Duration,
     pub heartbeat_interval: Duration,
@@ -29,8 +34,12 @@ impl Default for Limits {
             participants: 64,
             pending: 512,
             outbound: 128,
+            outbound_bytes_per_connection: 256 * 1024,
+            outbound_bytes_global: 32 * 1024 * 1024,
             ip_history: 4096,
             connections_per_ip: 64,
+            admissions_per_ip_per_minute: 60,
+            room_attempts_per_ip_per_minute: 120,
             pending_timeout: Duration::from_secs(12),
             idle_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(15),
@@ -40,14 +49,40 @@ impl Default for Limits {
     }
 }
 impl Limits {
-    pub(crate) fn validate(&self) {
-        assert!((1..=1024).contains(&self.connections));
-        assert!((1..=256).contains(&self.rooms));
-        assert!((1..=64).contains(&self.participants));
-        assert!((1..=512).contains(&self.pending));
-        assert!((1..=128).contains(&self.outbound));
-        assert!((1..=4096).contains(&self.ip_history));
-        assert!((1..=64).contains(&self.connections_per_ip));
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        for (name, value, maximum) in [
+            ("MAX_CONNECTIONS", self.connections, 1024),
+            ("MAX_ROOMS", self.rooms, 256),
+            ("MAX_PARTICIPANTS", self.participants, 64),
+            ("MAX_PENDING_JOINS", self.pending, 512),
+            ("MAX_OUTBOUND_MESSAGES", self.outbound, 128),
+            ("ip_history", self.ip_history, 4096),
+            ("MAX_CONNECTIONS_PER_IP", self.connections_per_ip, 1024),
+            (
+                "MAX_ADMISSIONS_PER_IP_PER_MINUTE",
+                self.admissions_per_ip_per_minute as usize,
+                65536,
+            ),
+            (
+                "MAX_ROOM_ATTEMPTS_PER_IP_PER_MINUTE",
+                self.room_attempts_per_ip_per_minute as usize,
+                65536,
+            ),
+            (
+                "MAX_OUTBOUND_BYTES_PER_CONNECTION",
+                self.outbound_bytes_per_connection,
+                1024 * 1024,
+            ),
+            (
+                "MAX_OUTBOUND_BYTES_GLOBAL",
+                self.outbound_bytes_global,
+                64 * 1024 * 1024,
+            ),
+        ] {
+            if !(1..=maximum).contains(&value) {
+                return Err(name);
+            }
+        }
         for d in [
             self.pending_timeout,
             self.idle_timeout,
@@ -55,8 +90,11 @@ impl Limits {
             self.heartbeat_timeout,
             self.write_timeout,
         ] {
-            assert!(!d.is_zero() && d <= Duration::from_secs(60));
+            if d.is_zero() || d > Duration::from_secs(60) {
+                return Err("timeout must be within 0..=60 seconds and nonzero");
+            }
         }
+        Ok(())
     }
 }
 pub(crate) struct Window {
@@ -99,7 +137,7 @@ enum Membership {
     Active(RoomId),
 }
 pub(crate) struct Connection {
-    tx: mpsc::Sender<ServerMessage>,
+    tx: outbound::Sender,
     cancel: watch::Sender<bool>,
     ip: IpAddr,
     created: Instant,
@@ -127,11 +165,14 @@ struct Room {
 }
 pub(crate) struct Delivery {
     pub target: u64,
-    pub tx: mpsc::Sender<ServerMessage>,
+    pub tx: outbound::Sender,
     pub message: ServerMessage,
     // Signal congestion reports backpressure to its source; it must not let a
     // flooding participant tear down the host's control plane.
     pub source: Option<u64>,
+    // Activation may release the joiner only if its host's notification was
+    // enqueued successfully in this same ordered batch.
+    pub requires: Option<u64>,
 }
 #[derive(Default)]
 pub(crate) struct Effects {
@@ -155,7 +196,7 @@ fn random() -> [u8; 16] {
 }
 impl State {
     pub fn new(limits: Limits) -> Self {
-        limits.validate();
+        limits.validate().expect("invalid rendezvous limits");
         Self {
             authority: AuthorityId(random()),
             limits,
@@ -172,7 +213,7 @@ impl State {
     pub fn admit(
         &mut self,
         ip: IpAddr,
-        tx: mpsc::Sender<ServerMessage>,
+        tx: outbound::Sender,
         cancel: watch::Sender<bool>,
         now: Instant,
     ) -> Result<u64, ErrorCode> {
@@ -186,8 +227,16 @@ impl State {
         let history = self.ips.entry(ip).or_insert_with(|| IpHistory {
             connections: 0,
             touched: now,
-            admission: Window::new(60, Duration::from_secs(60), now),
-            attempts: Window::new(120, Duration::from_secs(60), now),
+            admission: Window::new(
+                self.limits.admissions_per_ip_per_minute,
+                Duration::from_secs(60),
+                now,
+            ),
+            attempts: Window::new(
+                self.limits.room_attempts_per_ip_per_minute,
+                Duration::from_secs(60),
+                now,
+            ),
         });
         history.touched = now;
         if history.connections >= self.limits.connections_per_ip || !history.admission.take(now) {
@@ -219,6 +268,7 @@ impl State {
                 tx: c.tx.clone(),
                 message,
                 source: None,
+                requires: None,
             });
         }
     }
@@ -413,6 +463,16 @@ impl State {
             .unwrap()
             .membership = Some(Membership::Active(room_id));
         let mut e = Effects::default();
+        // This ordering is a protocol contract. Server::transition serializes
+        // the state commit and both enqueues against every competing relay.
+        self.emit(
+            &mut e,
+            id,
+            ServerMessage::PeerJoined {
+                peer_id: member.peer,
+                member_id: member.member,
+            },
+        );
         self.emit(
             &mut e,
             member.connection,
@@ -423,14 +483,7 @@ impl State {
                 host_member_id: host.member,
             },
         );
-        self.emit(
-            &mut e,
-            id,
-            ServerMessage::PeerJoined {
-                peer_id: member.peer,
-                member_id: member.member,
-            },
-        );
+        e.deliveries.last_mut().unwrap().requires = Some(id);
         Ok(e)
     }
     fn signal(
