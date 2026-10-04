@@ -4,6 +4,7 @@ use tokio::sync::{mpsc, Semaphore};
 mod auth;
 mod caps;
 mod ordering;
+mod reject;
 #[test]
 fn silent_routed_members_cannot_permanently_fill_room() {
     let mut h = Harness::new(Limits::default());

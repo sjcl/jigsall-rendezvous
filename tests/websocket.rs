@@ -78,6 +78,97 @@ async fn send(socket: &mut Socket, message: ClientMessage) {
         .unwrap();
 }
 #[tokio::test]
+async fn rejected_pending_join_releases_slot_and_host_accepts_same_peer_again() {
+    let f = Fixture::new(Limits {
+        participants: 1,
+        ..Limits::default()
+    })
+    .await;
+    let mut host = f.connect().await;
+    send(
+        &mut host,
+        ClientMessage::CreateRoom {
+            peer_id: PeerId([1; 16]),
+        },
+    )
+    .await;
+    let ServerMessage::RoomCreated { room_code, .. } = receive(&mut host).await else {
+        panic!()
+    };
+    let mut old_member = None;
+    for reject in [true, false] {
+        let mut joiner = f.connect().await;
+        send(
+            &mut joiner,
+            ClientMessage::JoinRoom {
+                room_code: room_code.clone(),
+                peer_id: PeerId([2; 16]),
+            },
+        )
+        .await;
+        let ServerMessage::AuthorizePeer {
+            join_id, member_id, ..
+        } = receive(&mut host).await
+        else {
+            panic!()
+        };
+        if reject {
+            old_member = Some(member_id);
+            send(&mut host, ClientMessage::AuthorizeReject { join_id }).await;
+            assert_eq!(
+                receive(&mut joiner).await,
+                ServerMessage::Error {
+                    code: ErrorCode::Capacity
+                }
+            );
+            assert_eq!(
+                receive(&mut host).await,
+                ServerMessage::PeerUnavailable {
+                    peer_id: PeerId([2; 16])
+                }
+            );
+        } else {
+            assert_ne!(old_member, Some(member_id));
+            send(&mut host, ClientMessage::AuthorizeAck { join_id }).await;
+            assert_eq!(
+                receive(&mut host).await,
+                ServerMessage::PeerJoined {
+                    peer_id: PeerId([2; 16]),
+                    member_id
+                }
+            );
+            assert!(matches!(
+                receive(&mut joiner).await,
+                ServerMessage::RoomJoined { .. }
+            ));
+            send(
+                &mut host,
+                ClientMessage::ConfirmPeer {
+                    peer_id: PeerId([2; 16]),
+                    member_id,
+                },
+            )
+            .await;
+            send(
+                &mut joiner,
+                ClientMessage::Signal {
+                    to_peer_id: PeerId([1; 16]),
+                    payload_base64: "AP8H".into(),
+                },
+            )
+            .await;
+            assert_eq!(
+                receive(&mut host).await,
+                ServerMessage::Signal {
+                    from_peer_id: PeerId([2; 16]),
+                    payload_base64: "AP8H".into()
+                }
+            );
+        }
+    }
+    f.shutdown().await;
+}
+#[tokio::test]
 async fn ponging_routed_member_expires_but_confirmed_member_keeps_routing() {
     for confirmed in [false, true] {
         let f = Fixture::new(Limits {

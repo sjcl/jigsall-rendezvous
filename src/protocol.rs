@@ -102,6 +102,9 @@ pub enum ClientMessage {
     AuthorizeAck {
         join_id: JoinId,
     },
+    AuthorizeReject {
+        join_id: JoinId,
+    },
     ConfirmPeer {
         peer_id: PeerId,
         member_id: MemberId,
@@ -219,6 +222,29 @@ fn parse<M: serde::de::DeserializeOwned>(text: &str) -> Result<M, ErrorCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn authorization_rejection_requires_only_exact_join_identity() {
+        let valid =
+            r#"{"v":1,"type":"authorize_reject","join_id":"66666666-6666-4666-8666-666666666666"}"#;
+        assert!(matches!(
+            parse_client(valid),
+            Ok(ClientMessage::AuthorizeReject { .. })
+        ));
+        for invalid in [
+            r#"{"v":1,"type":"authorize_reject"}"#.to_owned(),
+            valid.replace(
+                "66666666-6666-4666-8666-666666666666",
+                "00000000-0000-0000-0000-000000000000",
+            ),
+            valid.replace(
+                '}',
+                ",\"peer_id\":\"55555555-5555-4555-8555-555555555555\"}",
+            ),
+            valid.replace('}', ",\"reason\":\"capacity\"}"),
+        ] {
+            assert_eq!(parse_client(&invalid), Err(ErrorCode::InvalidMessage));
+        }
+    }
     #[test]
     fn lifecycle_requires_exact_typed_identity_without_authority_fields() {
         for kind in ["confirm_peer", "revoke_peer"] {

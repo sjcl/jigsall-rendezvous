@@ -16,7 +16,7 @@ messages are each bounded at 24 KiB. WS Ping/Pong is outside the JSON schema.
 | RoomCode | Ten Crockford Base32 characters; CSPRNG 50 bits, ASCII case normalized to upper, no I/L/O/U aliases |
 | MemberId | CSPRNG 128-bit anonymous member identity; issued only by server |
 | PeerId | Existing GNS/Puzzella 128-bit process routing label; bound to the current WebSocket membership |
-| JoinId | CSPRNG 128-bit pending authorization transaction; host ACK only |
+| JoinId | CSPRNG 128-bit pending authorization transaction; host ACK/Reject only |
 
 IDs are non-nil lowercase hyphenated UUID-shaped strings; noncanonical spellings
 are rejected. Random server IDs use UUID v4. Client PeerIds need not carry UUID
@@ -36,7 +36,17 @@ in an explicitly versioned extension. Current routing key is
    slot and emits AuthorizePeer(join_id, peer_id, member_id) **only to the host**.
 4. Host adapter verifies its current room/authority, calls authorize_peer, then
    sends AuthorizeAck(join_id). ACK must originate from this room's host before
-   the fixed 12-second deadline. A duplicate/stale/foreign ACK is rejected.
+   the fixed 12-second deadline. A duplicate/stale/foreign ACK returns
+   unknown_target; an expired pending ACK returns join_timeout. These host-side
+   cancellation/expiry races are nonfatal and do not activate any member.
+   If a retained unavailable/revoking PeerId or local route/native capacity
+   prevents safe admission, the host instead sends AuthorizeReject(join_id).
+   Only this room's host may reject its pending transaction. The server sends
+   capacity to the joiner (join_timeout if expired), closes that connection,
+   immediately frees all pending/peer/IP/participant resources and emits
+   PeerUnavailable to the host as rejection completion. The room continues.
+   A stale/duplicate/foreign Reject returns unknown_target; a participant
+   sender returns protocol_violation.
 5. Server commits the participant's Routed state with a fixed 30-second game-auth
    deadline, **enqueues PeerJoined to the
    host first**, then **enqueues RoomJoined to the joiner**. The state commit and
@@ -76,6 +86,13 @@ after its notification. Cross-socket network delivery order is not assumed.
 This ordering prevents signaling before route authorization **and activation**.
 Clients may fail closed if an authenticated server violates this contract;
 pending routes must not be activated implicitly by a Signal.
+Cleanup and new authorization share that serialized FIFO: an old member's
+PeerUnavailable precedes AuthorizePeer for a reused PeerId; rejected pending
+membership completion precedes any further authorization reusing it. The host
+tracks rejected transactions separately and consumes their PeerUnavailable
+without changing an older retained native route for that same PeerId, even if
+that route has already retired. Clients keep this history bounded by the 64-slot
+room limit and do not evict it before completion.
 Host adapter does not advertise a peer to its caller until PeerJoined confirms
 activation. The client uses new_routed and never derives identities from opaque
 GNS payloads. Subsequent Connected still requires the existing SecureTransport /
@@ -84,6 +101,7 @@ SPAKE2 password protocol before any player or game state transition.
 ## Messages
 
 Client: create_room(peer_id), join_room(room_code, peer_id), authorize_ack(join_id),
+authorize_reject(join_id),
 confirm_peer(peer_id, member_id), revoke_peer(peer_id, member_id),
 signal(to_peer_id, payload_base64), leave_room(). A socket belongs to at most one
 room. Duplicate PeerIds are rejected across live/pending memberships. LeaveRoom
@@ -105,7 +123,8 @@ Error codes: protocol_violation, unsupported_version, invalid_message,
 not_in_room, unknown_room, room_full, capacity, duplicate_peer, unknown_target,
 invalid_signal, signal_too_large, rate_limited, join_timeout, backpressure.
 Schema/framing violations close; operation rejection normally leaves the socket
-open for bounded retries. Pending/Routed expiry sends join_timeout and closes its
+open for bounded retries. AuthorizeReject sends capacity and closes only its
+pending joiner. Pending/Routed expiry sends join_timeout and closes its
 socket. Global admission rejection uses HTTP 429/503 before upgrade. A control
 queue overflow, write failure, frame-rate exhaustion or heartbeat expiry closes
 and cleans the connection. ConfirmPeer is a host-reported lifecycle milestone;
@@ -161,6 +180,10 @@ schema and fixtures must be updated together. Field order has no semantic meanin
 
 ```json
 {"v":1,"type":"authorize_ack","join_id":"66666666-6666-4666-8666-666666666666"}
+```
+
+```json
+{"v":1,"type":"authorize_reject","join_id":"66666666-6666-4666-8666-666666666666"}
 ```
 
 ```json

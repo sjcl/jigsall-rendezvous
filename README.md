@@ -75,6 +75,9 @@ characters), normalize ASCII case, exclude I/L/O/U and retry collisions at most
 Joining reserves one slot and has a fixed 12-second deadline. The host receives
 AuthorizePeer, installs RouteOrigin/authorize_peer locally, then sends
 AuthorizeAck. This ACK permits routing with a fixed 30-second game-auth deadline.
+If retained native routes or local capacity prevent admission, the host sends
+AuthorizeReject. The server frees the pending slot immediately, returns Capacity
+to the joiner and leaves the host room open.
 The server enqueues PeerJoined
 to the host **before** RoomJoined to the joiner, within the same ordered
 transition. Both activation notifications precede subsequent signals to their

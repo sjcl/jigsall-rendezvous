@@ -318,6 +318,7 @@ impl State {
                 self.join(id, room_code, peer_id, now)
             }
             ClientMessage::AuthorizeAck { join_id } => self.ack(id, join_id, now),
+            ClientMessage::AuthorizeReject { join_id } => self.reject(id, join_id, now),
             ClientMessage::ConfirmPeer { peer_id, member_id } => {
                 self.lifecycle(id, peer_id, member_id, false, now)
             }
@@ -460,10 +461,7 @@ impl State {
             return Err(ErrorCode::ProtocolViolation);
         };
         let room = self.rooms.get_mut(&room_id).unwrap();
-        let pending = room
-            .pending
-            .get(&join)
-            .ok_or(ErrorCode::ProtocolViolation)?;
+        let pending = room.pending.get(&join).ok_or(ErrorCode::UnknownTarget)?;
         if now >= pending.deadline {
             return Err(ErrorCode::JoinTimeout);
         }
@@ -498,6 +496,27 @@ impl State {
             },
         );
         e.deliveries.last_mut().unwrap().requires = Some(id);
+        Ok(e)
+    }
+    fn reject(&mut self, id: u64, join: JoinId, now: Instant) -> Result<Effects, ErrorCode> {
+        let Some(Membership::Host(room_id)) = self.connections[&id].membership else {
+            return Err(ErrorCode::ProtocolViolation);
+        };
+        let pending = self.rooms[&room_id]
+            .pending
+            .get(&join)
+            .ok_or(ErrorCode::UnknownTarget)?;
+        let target = pending.member.connection;
+        let code = if now >= pending.deadline {
+            ErrorCode::JoinTimeout
+        } else {
+            ErrorCode::Capacity
+        };
+        let mut e = Effects::default();
+        self.emit(&mut e, target, ServerMessage::Error { code });
+        // PeerUnavailable completes the host's rejection transaction, even
+        // though it installed no route for this pending membership.
+        self.disconnect(target, &mut e, now);
         Ok(e)
     }
     fn lifecycle(
