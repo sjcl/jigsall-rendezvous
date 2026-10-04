@@ -1,0 +1,6 @@
+# Only the locked manifest and server sources are needed to build the image.
+**
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**

@@ -25,6 +25,19 @@ numeric socket address (`127.0.0.1:9000`, `[::1]:9000`, etc.).
 `GET /v1/ws` upgrades to the JSON WebSocket protocol described in
 [PROTOCOL_V1.md](docs/PROTOCOL_V1.md).
 
+## Docker
+
+```sh
+docker build --pull -t puzzella-rendezvous:local .
+```
+
+The multi-stage [Dockerfile](Dockerfile) builds with Rust 1.95 and runs only the
+release server binary on Debian slim as UID/GID 10001. It listens on
+`0.0.0.0:8080` inside the container; configure the existing environment variables
+with `docker run --env` or `--env-file`. Proxy trust defaults to empty.
+Caddy remains a separate service. See [Docker deployment](docs/DEPLOYMENT.md#docker-behind-caddy)
+for private networking and trusted-proxy settings.
+
 ## Internet deployment and trust
 
 ```text

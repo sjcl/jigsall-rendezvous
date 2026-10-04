@@ -50,6 +50,69 @@ connection/rate-limit plugin. Apply edge/firewall connection and request limits
 for HTTP sockets that have not upgraded. Application caps cover admitted WS
 reservations/connections and their state, not every pre-upgrade TCP socket.
 
+## Docker behind Caddy
+
+Build from the repository root:
+
+```sh
+docker build --pull -t puzzella-rendezvous:local .
+```
+
+The image contains the release binary and Debian runtime libraries, runs as
+UID/GID 10001, and supports a read-only filesystem. It serves plain HTTP/WS on
+`0.0.0.0:8080` by default. Caddy handles TLS separately; no Caddy binary or
+certificates are included. No persistent volume is needed: restarting the
+container clears all rooms, as with a native process. Runtime settings below
+remain available through `--env` or `--env-file`.
+
+### Caddy on the Linux host
+
+Use host networking and override the listener to loopback. This preserves the
+existing [deploy/Caddyfile](../deploy/Caddyfile) upstream and lets the backend
+trust exactly the local Caddy connection:
+
+```sh
+docker run -d --name puzzella-rendezvous --restart unless-stopped \
+  --network host --read-only --cap-drop ALL \
+  --security-opt no-new-privileges=true --stop-timeout 10 \
+  --env PUZZELLA_RENDEZVOUS_LISTEN=127.0.0.1:8080 \
+  --env PUZZELLA_RENDEZVOUS_TRUSTED_PROXIES=127.0.0.1/32 \
+  puzzella-rendezvous:local
+curl --fail http://127.0.0.1:8080/healthz
+```
+
+This example requires Docker Engine on Linux. Do not use `--publish` with host
+networking. Keep the loopback listener override when using this mode.
+
+### Caddy in an existing container
+
+Connect the existing Caddy container to a dedicated backend network, assigning
+it a stable IP. The example assumes its container name is `caddy`; choose an
+unused subnet for your deployment:
+
+```sh
+docker network create --subnet 172.30.0.0/24 rendezvous-backend
+docker network connect --ip 172.30.0.2 rendezvous-backend caddy
+docker run -d --name puzzella-rendezvous --restart unless-stopped \
+  --network rendezvous-backend --read-only --cap-drop ALL \
+  --security-opt no-new-privileges=true --stop-timeout 10 \
+  --env PUZZELLA_RENDEZVOUS_TRUSTED_PROXIES=172.30.0.2/32 \
+  puzzella-rendezvous:local
+```
+
+In the existing Caddy configuration, use `reverse_proxy puzzella-rendezvous:8080`
+instead of `reverse_proxy 127.0.0.1:8080`, retaining the sample's route/header
+policy and transport deadlines. Preserve the backend-network attachment and
+static Caddy IP in your container manager when recreating it. Publish only
+Caddy's public ports; the backend needs no published port. Trust Caddy's exact
+IP, rather than the entire Docker/private address range. The native
+`deploy/rendezvous.env.example` sets a loopback listener/proxy and therefore
+needs those values changed before use with this bridge-network example.
+
+Use `docker logs puzzella-rendezvous` for server logs.
+`docker stop --time 10 puzzella-rendezvous` delivers SIGTERM directly to the
+server's PID 1 and allows its bounded shutdown drain to finish.
+
 ## Source-IP trust policy
 
 `PUZZELLA_RENDEZVOUS_TRUSTED_PROXIES` defaults to empty (trust no proxy). Configure
