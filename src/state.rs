@@ -1,0 +1,593 @@
+use crate::protocol::*;
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    time::{Duration, Instant},
+};
+use tokio::sync::{mpsc, watch};
+
+#[derive(Clone, Debug)]
+pub struct Limits {
+    pub connections: usize,
+    pub rooms: usize,
+    pub participants: usize,
+    pub pending: usize,
+    pub outbound: usize,
+    pub ip_history: usize,
+    pub connections_per_ip: usize,
+    pub pending_timeout: Duration,
+    pub idle_timeout: Duration,
+    pub heartbeat_interval: Duration,
+    pub heartbeat_timeout: Duration,
+    pub write_timeout: Duration,
+}
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            connections: 1024,
+            rooms: 256,
+            participants: 64,
+            pending: 512,
+            outbound: 128,
+            ip_history: 4096,
+            connections_per_ip: 64,
+            pending_timeout: Duration::from_secs(12),
+            idle_timeout: Duration::from_secs(30),
+            heartbeat_interval: Duration::from_secs(15),
+            heartbeat_timeout: Duration::from_secs(15),
+            write_timeout: Duration::from_secs(2),
+        }
+    }
+}
+impl Limits {
+    pub(crate) fn validate(&self) {
+        assert!((1..=1024).contains(&self.connections));
+        assert!((1..=256).contains(&self.rooms));
+        assert!((1..=64).contains(&self.participants));
+        assert!((1..=512).contains(&self.pending));
+        assert!((1..=128).contains(&self.outbound));
+        assert!((1..=4096).contains(&self.ip_history));
+        assert!((1..=64).contains(&self.connections_per_ip));
+        for d in [
+            self.pending_timeout,
+            self.idle_timeout,
+            self.heartbeat_interval,
+            self.heartbeat_timeout,
+            self.write_timeout,
+        ] {
+            assert!(!d.is_zero() && d <= Duration::from_secs(60));
+        }
+    }
+}
+pub(crate) struct Window {
+    started: Instant,
+    count: u32,
+    limit: u32,
+    period: Duration,
+}
+impl Window {
+    pub(crate) fn new(limit: u32, period: Duration, now: Instant) -> Self {
+        Self {
+            started: now,
+            count: 0,
+            limit,
+            period,
+        }
+    }
+    pub(crate) fn take(&mut self, now: Instant) -> bool {
+        if now.saturating_duration_since(self.started) >= self.period {
+            self.started = now;
+            self.count = 0;
+        }
+        if self.count >= self.limit {
+            return false;
+        }
+        self.count += 1;
+        true
+    }
+}
+struct IpHistory {
+    connections: usize,
+    touched: Instant,
+    admission: Window,
+    attempts: Window,
+}
+#[derive(Clone, Copy)]
+enum Membership {
+    Host(RoomId),
+    Pending(RoomId, JoinId),
+    Active(RoomId),
+}
+pub(crate) struct Connection {
+    tx: mpsc::Sender<ServerMessage>,
+    cancel: watch::Sender<bool>,
+    ip: IpAddr,
+    created: Instant,
+    membership: Option<Membership>,
+    peer: Option<PeerId>,
+    messages: Window,
+    signals: Window,
+    attempts: Window,
+}
+#[derive(Clone, Copy)]
+struct Member {
+    connection: u64,
+    peer: PeerId,
+    member: MemberId,
+}
+struct Pending {
+    member: Member,
+    deadline: Instant,
+}
+struct Room {
+    code: RoomCode,
+    host: Member,
+    members: HashMap<PeerId, Member>,
+    pending: HashMap<JoinId, Pending>,
+}
+pub(crate) struct Delivery {
+    pub target: u64,
+    pub tx: mpsc::Sender<ServerMessage>,
+    pub message: ServerMessage,
+    // Signal congestion reports backpressure to its source; it must not let a
+    // flooding participant tear down the host's control plane.
+    pub source: Option<u64>,
+}
+#[derive(Default)]
+pub(crate) struct Effects {
+    pub deliveries: Vec<Delivery>,
+    pub cancel: Vec<watch::Sender<bool>>,
+}
+pub(crate) struct State {
+    pub authority: AuthorityId,
+    pub limits: Limits,
+    pub stopping: bool,
+    next: u64,
+    pub connections: HashMap<u64, Connection>,
+    rooms: HashMap<RoomId, Room>,
+    codes: HashMap<RoomCode, RoomId>,
+    peers: HashMap<PeerId, u64>,
+    ips: HashMap<IpAddr, IpHistory>,
+    pending: usize,
+}
+fn random() -> [u8; 16] {
+    *uuid::Uuid::new_v4().as_bytes()
+}
+impl State {
+    pub fn new(limits: Limits) -> Self {
+        limits.validate();
+        Self {
+            authority: AuthorityId(random()),
+            limits,
+            stopping: false,
+            next: 1,
+            connections: HashMap::new(),
+            rooms: HashMap::new(),
+            codes: HashMap::new(),
+            peers: HashMap::new(),
+            ips: HashMap::new(),
+            pending: 0,
+        }
+    }
+    pub fn admit(
+        &mut self,
+        ip: IpAddr,
+        tx: mpsc::Sender<ServerMessage>,
+        cancel: watch::Sender<bool>,
+        now: Instant,
+    ) -> Result<u64, ErrorCode> {
+        self.prune_ips(now);
+        if self.stopping || self.connections.len() >= self.limits.connections {
+            return Err(ErrorCode::Capacity);
+        }
+        if !self.ips.contains_key(&ip) && self.ips.len() >= self.limits.ip_history {
+            return Err(ErrorCode::Capacity);
+        }
+        let history = self.ips.entry(ip).or_insert_with(|| IpHistory {
+            connections: 0,
+            touched: now,
+            admission: Window::new(60, Duration::from_secs(60), now),
+            attempts: Window::new(120, Duration::from_secs(60), now),
+        });
+        history.touched = now;
+        if history.connections >= self.limits.connections_per_ip || !history.admission.take(now) {
+            return Err(ErrorCode::RateLimited);
+        }
+        let id = self.next;
+        self.next = self.next.checked_add(1).ok_or(ErrorCode::Capacity)?;
+        history.connections += 1;
+        self.connections.insert(
+            id,
+            Connection {
+                tx,
+                cancel,
+                ip,
+                created: now,
+                membership: None,
+                peer: None,
+                messages: Window::new(256, Duration::from_secs(1), now),
+                signals: Window::new(32, Duration::from_secs(1), now),
+                attempts: Window::new(4, Duration::from_secs(10), now),
+            },
+        );
+        Ok(id)
+    }
+    fn emit(&self, effects: &mut Effects, target: u64, message: ServerMessage) {
+        if let Some(c) = self.connections.get(&target) {
+            effects.deliveries.push(Delivery {
+                target,
+                tx: c.tx.clone(),
+                message,
+                source: None,
+            });
+        }
+    }
+    pub fn welcome(&self, id: u64) -> Effects {
+        let mut e = Effects::default();
+        self.emit(
+            &mut e,
+            id,
+            ServerMessage::Welcome {
+                authority_id: self.authority,
+            },
+        );
+        e
+    }
+    pub fn error(&self, id: u64, code: ErrorCode) -> Effects {
+        let mut e = Effects::default();
+        self.emit(&mut e, id, ServerMessage::Error { code });
+        e
+    }
+    pub fn handle(&mut self, id: u64, message: ClientMessage, now: Instant) -> Effects {
+        let Some(c) = self.connections.get_mut(&id) else {
+            return Effects::default();
+        };
+        if !c.messages.take(now) {
+            let mut e = self.error(id, ErrorCode::RateLimited);
+            self.disconnect(id, &mut e, now);
+            return e;
+        }
+        if matches!(
+            message,
+            ClientMessage::CreateRoom { .. } | ClientMessage::JoinRoom { .. }
+        ) {
+            let ip = self.ips.get_mut(&c.ip).expect("admitted IP");
+            ip.touched = now;
+            if !c.attempts.take(now) || !ip.attempts.take(now) {
+                return self.error(id, ErrorCode::RateLimited);
+            }
+        }
+        let result = match message {
+            ClientMessage::CreateRoom { peer_id } => self.create(id, peer_id),
+            ClientMessage::JoinRoom { room_code, peer_id } => {
+                self.join(id, room_code, peer_id, now)
+            }
+            ClientMessage::AuthorizeAck { join_id } => self.ack(id, join_id, now),
+            ClientMessage::Signal {
+                to_peer_id,
+                payload_base64,
+            } => self.signal(id, to_peer_id, payload_base64, now),
+            ClientMessage::LeaveRoom {} => {
+                let mut e = Effects::default();
+                self.emit(&mut e, id, ServerMessage::RoomClosed {});
+                self.disconnect(id, &mut e, now);
+                Ok(e)
+            }
+        };
+        result.unwrap_or_else(|code| self.error(id, code))
+    }
+    fn vacant(&self, id: u64, peer: PeerId) -> Result<(), ErrorCode> {
+        if self.connections[&id].membership.is_some() {
+            return Err(ErrorCode::ProtocolViolation);
+        }
+        if self.peers.contains_key(&peer) {
+            return Err(ErrorCode::DuplicatePeer);
+        }
+        Ok(())
+    }
+    fn code_with(
+        &self,
+        mut generate: impl FnMut() -> Result<RoomCode, ErrorCode>,
+    ) -> Result<RoomCode, ErrorCode> {
+        for _ in 0..32 {
+            let code = generate()?;
+            if !self.codes.contains_key(&code) {
+                return Ok(code);
+            }
+        }
+        Err(ErrorCode::Capacity)
+    }
+    fn create(&mut self, id: u64, peer: PeerId) -> Result<Effects, ErrorCode> {
+        self.vacant(id, peer)?;
+        if self.rooms.len() >= self.limits.rooms {
+            return Err(ErrorCode::Capacity);
+        }
+        let code = self.code_with(|| {
+            let mut bytes = [0; 10];
+            getrandom::fill(&mut bytes).map_err(|_| ErrorCode::Capacity)?;
+            bytes
+                .iter()
+                .map(|b| CODE_ALPHABET[(b & 31) as usize] as char)
+                .collect::<String>()
+                .parse()
+                .map_err(|_| ErrorCode::Capacity)
+        })?;
+        let room = RoomId(random());
+        let host = Member {
+            connection: id,
+            peer,
+            member: MemberId(random()),
+        };
+        self.rooms.insert(
+            room,
+            Room {
+                code: code.clone(),
+                host,
+                members: HashMap::new(),
+                pending: HashMap::new(),
+            },
+        );
+        self.codes.insert(code.clone(), room);
+        self.peers.insert(peer, id);
+        let c = self.connections.get_mut(&id).unwrap();
+        c.membership = Some(Membership::Host(room));
+        c.peer = Some(peer);
+        c.signals.limit = 128;
+        let mut e = Effects::default();
+        self.emit(
+            &mut e,
+            id,
+            ServerMessage::RoomCreated {
+                room_id: room,
+                room_code: code,
+                self_member_id: host.member,
+            },
+        );
+        Ok(e)
+    }
+    fn join(
+        &mut self,
+        id: u64,
+        code: RoomCode,
+        peer: PeerId,
+        now: Instant,
+    ) -> Result<Effects, ErrorCode> {
+        self.vacant(id, peer)?;
+        let room_id = *self.codes.get(&code).ok_or(ErrorCode::UnknownRoom)?;
+        let room = self.rooms.get_mut(&room_id).unwrap();
+        if room.members.len() + room.pending.len() >= self.limits.participants {
+            return Err(ErrorCode::RoomFull);
+        }
+        if self.pending >= self.limits.pending {
+            return Err(ErrorCode::Capacity);
+        }
+        let join = JoinId(random());
+        let member = Member {
+            connection: id,
+            peer,
+            member: MemberId(random()),
+        };
+        room.pending.insert(
+            join,
+            Pending {
+                member,
+                deadline: now + self.limits.pending_timeout,
+            },
+        );
+        let host = room.host.connection;
+        self.pending += 1;
+        self.peers.insert(peer, id);
+        let c = self.connections.get_mut(&id).unwrap();
+        c.membership = Some(Membership::Pending(room_id, join));
+        c.peer = Some(peer);
+        let mut e = Effects::default();
+        self.emit(
+            &mut e,
+            host,
+            ServerMessage::AuthorizePeer {
+                join_id: join,
+                peer_id: peer,
+                member_id: member.member,
+            },
+        );
+        Ok(e)
+    }
+    fn ack(&mut self, id: u64, join: JoinId, now: Instant) -> Result<Effects, ErrorCode> {
+        let Some(Membership::Host(room_id)) = self.connections[&id].membership else {
+            return Err(ErrorCode::ProtocolViolation);
+        };
+        let room = self.rooms.get_mut(&room_id).unwrap();
+        let pending = room
+            .pending
+            .get(&join)
+            .ok_or(ErrorCode::ProtocolViolation)?;
+        if now >= pending.deadline {
+            return Err(ErrorCode::JoinTimeout);
+        }
+        let member = room.pending.remove(&join).unwrap().member;
+        let host = room.host;
+        room.members.insert(member.peer, member);
+        self.pending -= 1;
+        self.connections
+            .get_mut(&member.connection)
+            .unwrap()
+            .membership = Some(Membership::Active(room_id));
+        let mut e = Effects::default();
+        self.emit(
+            &mut e,
+            member.connection,
+            ServerMessage::RoomJoined {
+                room_id,
+                self_member_id: member.member,
+                host_peer_id: host.peer,
+                host_member_id: host.member,
+            },
+        );
+        self.emit(
+            &mut e,
+            id,
+            ServerMessage::PeerJoined {
+                peer_id: member.peer,
+                member_id: member.member,
+            },
+        );
+        Ok(e)
+    }
+    fn signal(
+        &mut self,
+        id: u64,
+        to: PeerId,
+        payload: String,
+        now: Instant,
+    ) -> Result<Effects, ErrorCode> {
+        let c = self.connections.get_mut(&id).unwrap();
+        if !c.signals.take(now) {
+            return Err(ErrorCode::RateLimited);
+        }
+        let (room_id, host) = match c.membership {
+            Some(Membership::Host(room)) => (room, true),
+            Some(Membership::Active(room)) => (room, false),
+            _ => return Err(ErrorCode::NotInRoom),
+        };
+        let from = c.peer.unwrap();
+        let room = &self.rooms[&room_id];
+        let target = if host {
+            room.members.get(&to).ok_or(ErrorCode::UnknownTarget)?
+        } else if to == room.host.peer {
+            &room.host
+        } else if room.members.contains_key(&to) {
+            return Err(ErrorCode::ProtocolViolation);
+        } else {
+            return Err(ErrorCode::UnknownTarget);
+        };
+        // Opaque GNS bytes are decoded only to validate size/canonical Base64.
+        decode_signal(&payload)?;
+        let mut e = Effects::default();
+        self.emit(
+            &mut e,
+            target.connection,
+            ServerMessage::Signal {
+                from_peer_id: from,
+                payload_base64: payload,
+            },
+        );
+        e.deliveries[0].source = Some(id);
+        Ok(e)
+    }
+    pub fn disconnect(&mut self, id: u64, e: &mut Effects, now: Instant) {
+        let Some(c) = self.connections.remove(&id) else {
+            return;
+        };
+        e.cancel.push(c.cancel);
+        let ip = self.ips.get_mut(&c.ip).unwrap();
+        ip.connections -= 1;
+        ip.touched = now;
+        if let Some(peer) = c.peer {
+            self.peers.remove(&peer);
+        }
+        match c.membership {
+            Some(Membership::Host(room_id)) => {
+                if let Some(room) = self.rooms.remove(&room_id) {
+                    self.codes.remove(&room.code);
+                    self.pending -= room.pending.len();
+                    let others = room
+                        .members
+                        .values()
+                        .copied()
+                        .chain(room.pending.values().map(|p| p.member))
+                        .collect::<Vec<_>>();
+                    for member in others {
+                        self.peers.remove(&member.peer);
+                        if let Some(other) = self.connections.get_mut(&member.connection) {
+                            other.peer = None;
+                            other.membership = None;
+                            // Fixed new admission deadline; arbitrary traffic cannot renew it.
+                            other.created = now;
+                        }
+                        self.emit(e, member.connection, ServerMessage::RoomClosed {});
+                    }
+                }
+            }
+            Some(Membership::Pending(room_id, join)) => {
+                if let Some(room) = self.rooms.get_mut(&room_id) {
+                    if room.pending.remove(&join).is_some() {
+                        self.pending -= 1;
+                    }
+                    let host = room.host.connection;
+                    self.emit(
+                        e,
+                        host,
+                        ServerMessage::PeerUnavailable {
+                            peer_id: c.peer.unwrap(),
+                        },
+                    );
+                }
+            }
+            Some(Membership::Active(room_id)) => {
+                if let Some(room) = self.rooms.get_mut(&room_id) {
+                    room.members.remove(&c.peer.unwrap());
+                    let host = room.host.connection;
+                    self.emit(
+                        e,
+                        host,
+                        ServerMessage::PeerUnavailable {
+                            peer_id: c.peer.unwrap(),
+                        },
+                    );
+                }
+            }
+            None => {}
+        }
+    }
+    fn prune_ips(&mut self, now: Instant) {
+        self.ips.retain(|_, ip| {
+            ip.connections != 0
+                || now.saturating_duration_since(ip.touched) < Duration::from_secs(300)
+        });
+    }
+    pub fn sweep(&mut self, now: Instant) -> Effects {
+        let mut expired = Vec::new();
+        for room in self.rooms.values() {
+            for p in room.pending.values().filter(|p| now >= p.deadline) {
+                expired.push((p.member.connection, ErrorCode::JoinTimeout));
+            }
+        }
+        for (&id, c) in &self.connections {
+            if c.membership.is_none()
+                && now.saturating_duration_since(c.created) >= self.limits.idle_timeout
+            {
+                expired.push((id, ErrorCode::NotInRoom));
+            }
+        }
+        let mut e = Effects::default();
+        for (id, code) in expired {
+            self.emit(&mut e, id, ServerMessage::Error { code });
+            self.disconnect(id, &mut e, now);
+        }
+        self.prune_ips(now);
+        e
+    }
+    pub fn shutdown(&mut self, now: Instant) -> Effects {
+        self.stopping = true;
+        let mut e = Effects::default();
+        let ids = self.connections.keys().copied().collect::<Vec<_>>();
+        for &id in &ids {
+            self.emit(&mut e, id, ServerMessage::RoomClosed {});
+        }
+        self.rooms.clear();
+        self.codes.clear();
+        self.peers.clear();
+        self.pending = 0;
+        for connection in self.connections.values_mut() {
+            connection.membership = None;
+            connection.peer = None;
+        }
+        for id in ids {
+            self.disconnect(id, &mut e, now);
+        }
+        e
+    }
+}
+
+#[cfg(test)]
+mod tests;

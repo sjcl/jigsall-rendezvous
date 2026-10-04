@@ -1,0 +1,159 @@
+# Rendezvous/signaling protocol v1
+
+Endpoint: `GET /v1/ws`. Every application message is one UTF-8 JSON text message
+with numeric `"v":1` and a lower snake_case `"type"`. Unknown versions return
+`unsupported_version` and close the control connection. Unknown message types,
+fields, duplicate fields, malformed IDs/JSON and oversized messages fail closed.
+Binary application messages close the connection. WS frames and reassembled
+messages are each bounded at 24 KiB. WS Ping/Pong is outside the JSON schema.
+
+## Identities
+
+| Wire field/type | Meaning |
+| --- | --- |
+| AuthorityId | CSPRNG 128-bit server process ID; changes on restart |
+| RoomId | CSPRNG 128-bit room identity; issued only by server |
+| RoomCode | Ten Crockford Base32 characters; CSPRNG 50 bits, ASCII case normalized to upper, no I/L/O/U aliases |
+| MemberId | CSPRNG 128-bit anonymous member identity; issued only by server |
+| PeerId | Existing GNS/Puzzella 128-bit process routing label; bound to the current WebSocket membership |
+| JoinId | CSPRNG 128-bit pending authorization transaction; host ACK only |
+
+IDs are non-nil lowercase hyphenated UUID-shaped strings; noncanonical spellings
+are rejected. Random server IDs use UUID v4. Client PeerIds need not carry UUID
+version/variant bits; all nonzero 16-byte values have the same canonical encoding.
+Clients never supply RoomId, MemberId, AuthorityId or a signal sender identity.
+Room code is not a game authentication credential. MemberId has no account/Sybil
+guarantee; future account authentication can replace its use as RouteOrigin.account
+in an explicitly versioned extension. Current routing key is
+`RouteOrigin(authority_id, room_id, remote_member_id)`.
+
+## Handshake and topology
+
+1. Server sends Welcome on an admitted WebSocket.
+2. Host sends CreateRoom(peer_id); server binds it and returns RoomCreated.
+3. Joiner sends JoinRoom(room_code, peer_id). The server reserves a participant
+   slot and emits AuthorizePeer(join_id, peer_id, member_id) **only to the host**.
+4. Host adapter verifies its current room/authority, calls authorize_peer, then
+   sends AuthorizeAck(join_id). ACK must originate from this room's host before
+   the fixed 12-second deadline. A duplicate/stale/foreign ACK is rejected.
+5. Server promotes the participant and returns RoomJoined to the joiner and
+   PeerJoined to the host. Joiner installs the host's route and only then emits
+   HostReady to its caller. The caller may connect_peer; the adapter starts no
+   password bootstrap or Sync/Ready.
+6. Signals travel only between this active host and an active participant.
+   Participant-to-participant relay is protocol_violation. Targets outside the
+   sender's room (including pending targets) are unknown_target. A pending sender
+   is not_in_room. Sender PeerId is taken from server connection state.
+
+This ordering prevents Joiner signaling from arriving before host authorization.
+Host adapter does not advertise a peer to its caller until PeerJoined confirms
+activation. The client uses new_routed and never derives identities from opaque
+GNS payloads. Subsequent Connected still requires the existing SecureTransport /
+SPAKE2 password protocol before any player or game state transition.
+
+## Messages
+
+Client: create_room(peer_id), join_room(room_code, peer_id), authorize_ack(join_id),
+signal(to_peer_id, payload_base64), leave_room(). A socket belongs to at most one
+room. Duplicate PeerIds are rejected across live/pending memberships. LeaveRoom
+ends this control connection; create/join again requires a new connection.
+
+Server: welcome(authority_id), room_created(room_id, room_code, self_member_id),
+authorize_peer(join_id, peer_id, member_id),
+room_joined(room_id, self_member_id, host_peer_id, host_member_id),
+peer_joined(peer_id, member_id), peer_unavailable(peer_id),
+signal(from_peer_id, payload_base64), room_closed(), error(code).
+
+Signal payloads use **canonical padded RFC 4648 standard Base64**, decoded length
+**1..=16,384 bytes**, exactly matching Puzzella MAX_SIGNAL_BYTES. Maximum Base64
+length is 21,848 bytes; decoded validation also rejects a 16,385-byte value that
+has the same encoded length. Server decodes only to validate size/encoding, relays
+the original canonical string, and never parses or logs GNS payloads.
+
+Error codes: protocol_violation, unsupported_version, invalid_message,
+not_in_room, unknown_room, room_full, capacity, duplicate_peer, unknown_target,
+invalid_signal, signal_too_large, rate_limited, join_timeout, backpressure.
+Schema/framing violations close; operation rejection normally leaves the socket
+open for bounded retries. Pending expiry sends join_timeout and closes its
+socket. Global admission rejection uses HTTP 429/503 before upgrade. A control
+queue overflow, write failure, frame-rate exhaustion or heartbeat expiry closes
+and cleans the connection. There is no game authentication status in this schema.
+
+## Lifecycle, TLS and future extensions
+
+PeerUnavailable means further routing to this peer is unavailable. RoomClosed
+means this room no longer admits/routes members. Neither event terminates GNS game
+connections. The adapter preserves active bindings and exposes control events;
+explicit release_route/revoke_peer belongs to the connection owner. Unactivated
+pending routes can be revoked safely on timeout/control loss. Host loss deletes
+the room/code; member loss removes its binding. No resume or restart persistence
+is defined. Future extensions may add authenticated accounts, resume tokens and
+room recovery with fresh authorization; v1 clients must reject unknown versions.
+
+Production uses server-authenticated WSS with certificate validation. A reverse
+proxy may terminate TLS in front of the localhost WS server. TCP peer IP is the
+only abuse source identity; proxy headers are ignored. See README for finite
+resource/rate/deadline limits. STUN/TURN is separate from this protocol.
+
+## Canonical golden JSON
+
+These values are fixed test vectors, not real identities. `C` and `S` distinguish
+direction in `tests/fixtures/protocol_v1.jsonl`; the prefix is not on the wire.
+Both repositories parse and round-trip these exact examples. The mirrored Rust
+schema and fixtures must be updated together. Field order has no semantic meaning.
+
+```json
+{"v":1,"type":"welcome","authority_id":"11111111-1111-4111-8111-111111111111"}
+```
+
+```json
+{"v":1,"type":"create_room","peer_id":"22222222-2222-4222-8222-222222222222"}
+```
+
+```json
+{"v":1,"type":"room_created","room_id":"33333333-3333-4333-8333-333333333333","room_code":"ABCDEFGHJK","self_member_id":"44444444-4444-4444-8444-444444444444"}
+```
+
+```json
+{"v":1,"type":"join_room","room_code":"ABCDEFGHJK","peer_id":"55555555-5555-4555-8555-555555555555"}
+```
+
+```json
+{"v":1,"type":"authorize_peer","join_id":"66666666-6666-4666-8666-666666666666","peer_id":"55555555-5555-4555-8555-555555555555","member_id":"77777777-7777-4777-8777-777777777777"}
+```
+
+```json
+{"v":1,"type":"authorize_ack","join_id":"66666666-6666-4666-8666-666666666666"}
+```
+
+```json
+{"v":1,"type":"room_joined","room_id":"33333333-3333-4333-8333-333333333333","self_member_id":"77777777-7777-4777-8777-777777777777","host_peer_id":"22222222-2222-4222-8222-222222222222","host_member_id":"44444444-4444-4444-8444-444444444444"}
+```
+
+```json
+{"v":1,"type":"peer_joined","peer_id":"55555555-5555-4555-8555-555555555555","member_id":"77777777-7777-4777-8777-777777777777"}
+```
+
+```json
+{"v":1,"type":"signal","to_peer_id":"22222222-2222-4222-8222-222222222222","payload_base64":"AP8H"}
+```
+
+```json
+{"v":1,"type":"signal","from_peer_id":"55555555-5555-4555-8555-555555555555","payload_base64":"AP8H"}
+```
+
+```json
+{"v":1,"type":"peer_unavailable","peer_id":"55555555-5555-4555-8555-555555555555"}
+```
+
+```json
+{"v":1,"type":"leave_room"}
+```
+
+```json
+{"v":1,"type":"room_closed"}
+```
+
+```json
+{"v":1,"type":"error","code":"join_timeout"}
+```
