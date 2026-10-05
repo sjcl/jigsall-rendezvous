@@ -4,6 +4,7 @@ mod outbound;
 pub mod protocol;
 mod proxy;
 mod state;
+pub mod turn;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -36,6 +37,7 @@ use tokio::{
 #[derive(Clone)]
 pub struct Server {
     state: Arc<Mutex<state::State>>,
+    turn: Option<turn::TurnService>,
     permits: Arc<Semaphore>,
     limits: Limits,
     trusted_proxies: TrustedProxies,
@@ -54,9 +56,14 @@ impl Server {
             permits: Arc::new(Semaphore::new(limits.connections)),
             outbound_bytes: Arc::new(Semaphore::new(limits.outbound_bytes_global)),
             dispatch_gate: Arc::new(Mutex::new(())),
+            turn: None,
             trusted_proxies,
             limits,
         }
+    }
+    pub fn with_turn(mut self, service: turn::TurnService) -> Self {
+        self.turn = Some(service);
+        self
     }
     pub fn router(&self) -> Router {
         Router::new()
@@ -116,6 +123,7 @@ struct Lease {
     server: Server,
     id: u64,
     _permit: OwnedSemaphorePermit,
+    turn_tx: outbound::Sender,
 }
 impl Drop for Lease {
     fn drop(&mut self) {
@@ -148,7 +156,7 @@ async fn upgrade(
         .state
         .lock()
         .unwrap()
-        .admit(ip, tx, cancel, Instant::now());
+        .admit(ip, tx.clone(), cancel, Instant::now());
     let Ok(id) = admitted else {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     };
@@ -156,6 +164,7 @@ async fn upgrade(
         server,
         id,
         _permit: permit,
+        turn_tx: tx,
     };
     // Lease is dropped on failed upgrade too. Reservation lifetime is also
     // bounded by the fixed pre-room admission deadline.
@@ -173,7 +182,33 @@ async fn session(
     mut cancelled: watch::Receiver<bool>,
 ) {
     let server = &lease.server;
-    server.transition(|state| state.welcome(lease.id));
+    let identifier = uuid::Uuid::new_v4().simple().to_string();
+    let initial = if let Some(service) = &server.turn {
+        tokio::select! {
+            biased;
+            _ = cancelled.changed() => return,
+            value = service.issue(&identifier) => value.ok(),
+        }
+    } else {
+        None
+    };
+    server.transition(|state| {
+        let mut effects = state.welcome(lease.id);
+        for delivery in &mut effects.deliveries {
+            if let ServerMessage::Welcome { turn, .. } = &mut delivery.message {
+                *turn = initial.clone();
+            }
+        }
+        effects
+    });
+    // Welcome fixes this control session's relay topology before peer ICE starts.
+    // Native ICE cannot add TURN to an already initialized direct-only session.
+    let _rotation = server.turn.clone().zip(initial).map(|(service, initial)| {
+        let tx = lease.turn_tx.clone();
+        turn::Rotation(tokio::spawn(async move {
+            service.rotate(identifier, tx, initial).await
+        }))
+    });
     let (mut sink, mut stream) = socket.split();
     let limits = &server.limits;
     let mut heartbeat = tokio::time::interval_at(

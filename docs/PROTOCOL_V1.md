@@ -217,3 +217,38 @@ schema and fixtures must be updated together. Field order has no semantic meanin
 ```json
 {"v":1,"type":"error","code":"join_timeout"}
 ```
+
+## TURN credential extension (v1)
+
+Welcome optionally contains `turn`; omission means TURN unavailable/disabled and
+permits direct ICE. The initial value is available before CreateRoom/JoinRoom and
+before any GNS peer connection. Only sessions with TURN in Welcome subsequently
+receive `turn_credentials` for future connection defaults and possibly
+`turn_unavailable` after expiry. Existing ICE connections retain their initial
+username/password for the lifetime of their allocations; a pushed value does not
+extend those credentials' expiry. An omitted initial value fixes this entire WSS
+session to direct-only; later credentials are not issued or installed.
+Rotation requires exactly the initial endpoint address set, independent of order;
+changed sets are rejected before listener defaults are mutated. Existing
+connection configuration is never replaced. These messages do not change room
+membership, SPAKE2 authentication or gameplay lifetime. Client-to-server TURN
+commands are rejected. Old/expired updates are ignored. On `turn_unavailable`,
+the client checks that its latest default has expired before clearing TURN
+server/user/password defaults and disabling the Relay bit for future incoming
+and outgoing connections. Existing ICE connections keep their original values.
+The initial endpoint set and expiry watermark remain intact: a fresh credential
+with the same set re-enables TURN for future peers. An early/stale unavailable
+event cannot clear a newer, still-valid default. These events do not close gameplay.
+
+```json
+{"v":1,"type":"turn_credentials","turn":{"expires_at_unix":2000086400,"servers":[{"address":"turn.cloudflare.com:3478","username":"short-lived-user","password":"short-lived-password"}]}}
+```
+
+`expires_at_unix` is the conservative issuance-start Unix time plus the requested
+TTL; Cloudflare does not include expiry in its response. `servers` has 1–4 unique
+UDP `host:port` entries. Address, username and password are each at most 256 bytes;
+credentials are printable ASCII without commas/NUL. Strings are not configuration
+URLs: TCP/TLS selection and list expansion are not supported. Typed validation and
+the 24-KiB WSS limit apply. Debug redacts credentials and parsing errors never quote
+the frame. Provider keys/tokens are absent from this schema. Golden fixtures and
+Rust definitions are mirrored in the game repository.

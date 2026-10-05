@@ -198,7 +198,7 @@ Tests exercise the fixed commit/enqueue ordering with competing threads, immedia
 signals in both directions on a multithread Tokio runtime, failed host activation
 enqueue, local/global byte exhaustion, in-flight reservations and all drop paths,
 spoofed/untrusted forwarding headers, malformed chains and a full 65-socket room
-through one trusted loopback proxy address. Golden wire schemas remain unchanged.
+through one trusted loopback proxy address. Shared v1 golden fixtures validate the canonical room messages and optional TURN extension.
 
 The optional real-Caddy test is
 `caddy_edge_replaces_spoofed_ip_and_relays_ordered_activation`. Start the backend
@@ -225,3 +225,107 @@ server fmt/all-target Clippy/build and all 30 automated tests passed, as did
 sample adaptation/provision validation and the separate real-Caddy loopback
 test. This verifies the configuration and proxy behavior; it does not claim a
 public certificate deployment or Internet NAT traversal result.
+
+## Optional Cloudflare Realtime TURN
+
+Create a TURN key and API token using Cloudflare's
+[credential guide](https://developers.cloudflare.com/realtime/turn/generate-credentials/).
+Keep both in the Rendezvous service's environment/secret store:
+
+```sh
+export PUZZELLA_RENDEZVOUS_TURN_KEY_ID=your-turn-key-id
+export PUZZELLA_RENDEZVOUS_TURN_API_TOKEN=your-server-only-api-token
+export PUZZELLA_RENDEZVOUS_TURN_TTL_SECONDS=86400
+```
+
+Never put these secrets in Puzzella's environment, `internet-defaults.env`,
+source, release binaries or WSS protocol. WSS distributes only short-lived
+username/password pairs and UDP server addresses. SPAKE2 remains the gameplay
+password authentication; TURN issuance confers no player identity or membership.
+The service must reach `rtc.live.cloudflare.com` over HTTPS. Docker includes CA
+certificates for that outbound connection; Caddy still terminates inbound WSS.
+
+| Setting | Default | Accepted range |
+| --- | --- | --- |
+| `PUZZELLA_RENDEZVOUS_TURN_TTL_SECONDS` | 86400 (24 hours) | 600–172800 seconds |
+| `PUZZELLA_RENDEZVOUS_TURN_MAX_CONCURRENCY` | 4 | 1–32 |
+| `PUZZELLA_RENDEZVOUS_TURN_REQUESTS_PER_MINUTE` | 120 | 1–4096 |
+
+Set both key variables or neither. Invalid/partial settings fail before binding,
+with secret-free diagnostics. TURN disabled or provider/network/rate-limit failure
+still produces Welcome and permits STUN/direct ICE. One three-second deadline
+covers both waiting for the shared concurrency permit and the HTTP call; a busy
+permit waits within this budget instead of immediately disabling TURN. A global
+issuance-rate rejection or deadline/provider failure still permits direct ICE.
+Welcome without TURN fixes that entire WSS session (including future peers) to
+direct-only: no background retries or later TURN push start. A newly opened control
+session can receive initial credentials after the provider recovers. Only admitted
+WebSockets can cause issuance; there is no client refresh command or publicly exposed credential HTTP endpoint. Existing
+IP/admission/resource limits apply in addition to the shared issuance quota and
+concurrency bound. Each socket has a random 128-bit `customIdentifier`, unrelated
+to IP, room, password or player identity, retained across its credential updates.
+
+Only sessions whose Welcome contains usable TURN start rotation. The endpoint
+address set must remain equal to Welcome's set (ordering may change). An endpoint
+addition/removal/change is an invalid rotation response; it is never pushed or
+partially applied, and the current credentials are retained during retry.
+Pushed credentials update host listener / future outgoing connection defaults
+only. Existing ICE connections keep the credentials with which they initialized:
+Refresh, CreatePermission and reallocation continue with A after defaults become B.
+This follows [RFC 8656 sections 5/6](https://www.rfc-editor.org/rfc/rfc8656.html#section-5);
+a different valid username on an existing allocation receives 441 Wrong Credentials.
+No native API replaces active allocation credentials.
+
+Default refresh starts at half the TTL (about 12 hours for the default). Failures retain
+the old credential and retry with 1–60 second bounded exponential backoff, capped
+by the remaining validity. Retries remain bounded after expiry so recovery can
+serve future peers on an initially TURN-enabled control session too. A new
+credential waits in a single retained slot if the outbound byte/message budget is
+full; it does not create an unbounded queue or
+close the room. Expiry can produce `turn_unavailable`; the client checks the latest
+default expiry and disables TURN in listener/future outgoing defaults so a new
+peer does not attempt an allocation with expired credentials. Existing routes
+retain their original configuration. The initial endpoint set stays fixed, and
+recovery re-enables future TURN when a fresh credential with that set arrives.
+An unavailable event received before the latest default expires is ignored;
+it is not a gameplay disconnect.
+
+Only `turn:host:port?transport=udp` entries are distributed (normally UDP ports 3478
+and 443). TCP/TLS entries are filtered out and credentials stay paired with their
+own server entries. Native ICE retains its host/reflexive preference over relay.
+TURN allocations may be gathered alongside direct candidates, but gameplay uses
+relay only when the selected route requires it.
+
+WSS control loss cancels issuance/rotation for that socket. Existing GNS,
+SecureTransport, SPAKE2, Sync/Ready and gameplay state continue independently.
+An existing TURN-only route can fail when its original credential expires, even
+if newer defaults keep arriving over WSS. Choose a TTL for the expected peer
+connection duration (default 24 hours, configurable up to 48 hours); a connection
+inherits the credential's remaining validity from issuance, not a fresh TTL.
+ICE restart /
+allocation migration and Rendezvous reconnect/resume are outside this implementation.
+Cloudflare's [TURN FAQ](https://developers.cloudflare.com/realtime/turn/faq/)
+documents the maximum TTL, expiry behavior and ICE restart recommendation.
+
+Normal CI uses mock HTTP/providers and a local TURN fixture, never production
+Cloudflare. To check real issuance manually, configure the secrets explicitly and
+run `cargo test --locked cloudflare_manual_credential_issue -- --ignored`.
+That test verifies credential issuance only; it does not establish or bill relay
+traffic. Real Cloudflare allocation and credential expiry require separate network validation.
+
+
+TURN verification on 2026-10-05 (Windows x86_64): 42 unit and 14 WebSocket tests
+passed; the production Cloudflare and real-Caddy checks remain opt-in. Fmt,
+all-target Clippy and the server/example builds passed. Mock HTTP verifies the
+API request and UDP credential pairing; WebSocket tests cover initial ordering,
+transient update failure, successful rotation, provider recovery, fixed initial
+availability, endpoint-set rejection, queued concurrent welcomes, and expired
+defaults becoming unavailable followed by provider recovery without room closure. The
+server's `turn_fixture_server` example also passed six local cross-repository
+smoke runs using Puzzella's `run_turn_smoke.py`, including fixed allocation
+credentials during pushed-default updates, forced-relay Sync/Ready
+and encrypted traffic after control shutdown, plus initially unavailable sessions
+remaining direct-only after mock API recovery. This uses loopback WS and a local
+UDP relay, with no production API requests. Fixture keys are static and provider
+metadata TTLs are accelerated; this does not validate actual credential expiry,
+48-hour sessions or ICE restart recovery.

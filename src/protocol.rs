@@ -1,4 +1,4 @@
-//! Mirrored in sjcl/puzzella game/src/network/gns/rendezvous/protocol.rs.
+//! Mirrored in sjcl/jigsall game/src/network/gns/rendezvous/protocol.rs.
 //! Change the canonical fixtures and both copies together; no gameplay data here.
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -78,6 +78,75 @@ impl<'de> Deserialize<'de> for RoomCode {
     }
 }
 
+/// UDP TURN endpoints only. Values are short-lived, never provider secrets.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TurnServer {
+    pub address: String,
+    pub username: String,
+    pub password: String,
+}
+impl fmt::Debug for TurnServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TurnServer")
+            .field("address", &self.address)
+            .field("username", &"[redacted]")
+            .field("password", &"[redacted]")
+            .finish()
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TurnCredentials {
+    pub expires_at_unix: u64,
+    pub servers: Vec<TurnServer>,
+}
+impl TurnCredentials {
+    /// Rotation changes credentials, never the initially configured endpoint set.
+    pub fn same_server_set(&self, other: &Self) -> bool {
+        self.servers.len() == other.servers.len()
+            && self
+                .servers
+                .iter()
+                .all(|s| other.servers.iter().any(|o| o.address == s.address))
+    }
+    pub fn validate(&self) -> Result<(), ErrorCode> {
+        if self.expires_at_unix == 0 || self.servers.is_empty() || self.servers.len() > 4 {
+            return Err(ErrorCode::InvalidMessage);
+        }
+        for server in &self.servers {
+            let Some((host, port)) = server.address.rsplit_once(':') else {
+                return Err(ErrorCode::InvalidMessage);
+            };
+            if host.is_empty()
+                || server.address.len() > 256
+                || !host
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b))
+                || !port.parse::<u16>().is_ok_and(|p| p != 0)
+                || [server.username.as_str(), server.password.as_str()]
+                    .iter()
+                    .any(|s| {
+                        s.is_empty()
+                            || s.len() > 256
+                            || !s.bytes().all(|b| b.is_ascii_graphic() && b != b',')
+                    })
+            {
+                return Err(ErrorCode::InvalidMessage);
+            }
+        }
+        if self
+            .servers
+            .iter()
+            .enumerate()
+            .any(|(i, s)| self.servers[..i].iter().any(|x| x.address == s.address))
+        {
+            return Err(ErrorCode::InvalidMessage);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Frame<M> {
     pub v: V1,
@@ -124,7 +193,13 @@ pub enum ClientMessage {
 pub enum ServerMessage {
     Welcome {
         authority_id: AuthorityId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<TurnCredentials>,
     },
+    TurnCredentials {
+        turn: TurnCredentials,
+    },
+    TurnUnavailable {},
     RoomCreated {
         room_id: RoomId,
         room_code: RoomCode,
@@ -198,7 +273,15 @@ pub fn parse_client(text: &str) -> Result<ClientMessage, ErrorCode> {
     parse::<ClientMessage>(text)
 }
 pub fn parse_server(text: &str) -> Result<ServerMessage, ErrorCode> {
-    parse::<ServerMessage>(text)
+    let message = parse::<ServerMessage>(text)?;
+    match &message {
+        ServerMessage::Welcome {
+            turn: Some(turn), ..
+        }
+        | ServerMessage::TurnCredentials { turn } => turn.validate()?,
+        _ => {}
+    }
+    Ok(message)
 }
 fn parse<M: serde::de::DeserializeOwned>(text: &str) -> Result<M, ErrorCode> {
     if text.len() > MAX_WS_BYTES {
@@ -270,6 +353,39 @@ mod tests {
                 assert_eq!(parse_client(&invalid), Err(ErrorCode::InvalidMessage));
             }
         }
+    }
+    #[test]
+    fn turn_schema_is_bounded_and_debug_redacts_credentials() {
+        let turn = TurnCredentials {
+            expires_at_unix: 2000000000,
+            servers: vec![TurnServer {
+                address: "turn.cloudflare.com:3478".into(),
+                username: "private-user".into(),
+                password: "private-password".into(),
+            }],
+        };
+        assert!(turn.validate().is_ok());
+        for message in [
+            ServerMessage::Welcome {
+                authority_id: AuthorityId([1; 16]),
+                turn: Some(turn.clone()),
+            },
+            ServerMessage::TurnCredentials { turn: turn.clone() },
+        ] {
+            assert!(!format!("{message:?}").contains("private-"));
+            let json = serde_json::to_string(&Frame::new(message)).unwrap();
+            assert!(parse_server(&json).is_ok());
+            assert!(parse_client(&json).is_err()); // No client-driven credential minting.
+        }
+        let mut invalid = turn.clone();
+        invalid.servers[0].username = "comma,value".into();
+        assert!(invalid.validate().is_err());
+        invalid = turn.clone();
+        invalid.servers[0].address = "turn:turn.cloudflare.com:3478?transport=tcp".into();
+        assert!(invalid.validate().is_err());
+        invalid = turn.clone();
+        invalid.servers = vec![turn.servers[0].clone(); 5];
+        assert!(invalid.validate().is_err());
     }
     #[test]
     fn golden_protocol_v1() {

@@ -1,9 +1,10 @@
-use crate::{Limits, TrustedProxies};
+use crate::{turn::TurnConfig, Limits, TrustedProxies};
 use std::{fmt, net::SocketAddr};
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub listen: SocketAddr,
+    pub turn: Option<TurnConfig>,
     pub limits: Limits,
     pub trusted_proxies: TrustedProxies,
 }
@@ -77,8 +78,50 @@ impl Config {
             .map_err(|reason| {
                 ConfigError(format!("PUZZELLA_RENDEZVOUS_TRUSTED_PROXIES: {reason}"))
             })?;
+        let key_id = read("PUZZELLA_RENDEZVOUS_TURN_KEY_ID")?.filter(|v| !v.is_empty());
+        let api_token = read("PUZZELLA_RENDEZVOUS_TURN_API_TOKEN")?.filter(|v| !v.is_empty());
+        let mut number = |name, default, min, max| -> Result<u64, ConfigError> {
+            let n = read(name)?
+                .map(|v| v.parse::<u64>())
+                .transpose()
+                .map_err(|_| ConfigError(format!("{name}: expected an integer")))?
+                .unwrap_or(default);
+            if !(min..=max).contains(&n) {
+                return Err(ConfigError(format!("{name}: out of range")));
+            }
+            Ok(n)
+        };
+        let ttl = number("PUZZELLA_RENDEZVOUS_TURN_TTL_SECONDS", 86400, 600, 172800)?;
+        let concurrency = number("PUZZELLA_RENDEZVOUS_TURN_MAX_CONCURRENCY", 4, 1, 32)? as usize;
+        let requests_per_minute =
+            number("PUZZELLA_RENDEZVOUS_TURN_REQUESTS_PER_MINUTE", 120, 1, 4096)? as u32;
+        let turn = match (key_id, api_token) {
+            (None, None) => None,
+            (Some(key_id), Some(api_token))
+                if key_id.len() <= 128
+                    && key_id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                    && api_token.len() <= 4096
+                    && api_token.bytes().all(|b| b.is_ascii_graphic()) =>
+            {
+                Some(TurnConfig {
+                    key_id,
+                    api_token,
+                    ttl: std::time::Duration::from_secs(ttl),
+                    concurrency,
+                    requests_per_minute,
+                })
+            }
+            _ => {
+                return Err(ConfigError(
+                    "TURN_KEY_ID and TURN_API_TOKEN must both be valid or both absent".into(),
+                ))
+            }
+        };
         Ok(Self {
             listen,
+            turn,
             limits,
             trusted_proxies,
         })
@@ -125,6 +168,28 @@ mod tests {
         assert_eq!(c.limits.admissions_per_ip_per_minute, 2048);
         assert_eq!(c.limits.room_attempts_per_ip_per_minute, 4096);
         assert_eq!(c.limits.outbound_bytes_global, 64 * 1024 * 1024);
+    }
+    #[test]
+    fn turn_configuration_is_optional_bounded_and_secret_safe() {
+        assert!(config(&[]).unwrap().turn.is_none());
+        let values = [
+            ("PUZZELLA_RENDEZVOUS_TURN_KEY_ID", "private-key"),
+            ("PUZZELLA_RENDEZVOUS_TURN_API_TOKEN", "private-token"),
+        ];
+        let valid = config(&values).unwrap();
+        assert_eq!(valid.turn.as_ref().unwrap().ttl.as_secs(), 86400);
+        assert!(!format!("{valid:?}").contains("private-"));
+        assert!(config(&values[..1]).is_err());
+        for (key, value) in [
+            ("PUZZELLA_RENDEZVOUS_TURN_TTL_SECONDS", "599"),
+            ("PUZZELLA_RENDEZVOUS_TURN_TTL_SECONDS", "172801"),
+            ("PUZZELLA_RENDEZVOUS_TURN_MAX_CONCURRENCY", "33"),
+            ("PUZZELLA_RENDEZVOUS_TURN_REQUESTS_PER_MINUTE", "0"),
+        ] {
+            let mut bad = values.to_vec();
+            bad.push((key, value));
+            assert!(config(&bad).is_err());
+        }
     }
     #[test]
     fn invalid_configuration_fails_before_binding() {

@@ -7,6 +7,9 @@ RUN cargo build --locked --release --bin puzzella-rendezvous
 
 FROM debian:bookworm-slim
 
+# Outbound Cloudflare HTTPS requires a root certificate store.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /app/target/release/puzzella-rendezvous /usr/local/bin/puzzella-rendezvous
 
 # TLS terminates at the external reverse proxy. Trust its IP explicitly at runtime.

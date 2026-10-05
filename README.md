@@ -3,7 +3,11 @@
 Async Rust (axum + Tokio) rendezvous/signaling v1 for Puzzella's custom GNS
 signaling. Hosts create a room; participants join with a ten-character room code.
 Only host–participant signaling is relayed. GNS native ICE establishes game P2P
-connections separately.
+connections separately. Optional Cloudflare Realtime TURN supplies UDP relay
+fallback and refreshes credentials for future peer connections through WSS.
+Existing TURN allocations keep their initial credentials.
+Direct ICE remains available when TURN is disabled or unavailable. See
+[TURN configuration and lifetime](docs/DEPLOYMENT.md#optional-cloudflare-realtime-turn).
 
 This server carries **no gameplay traffic** and accepts **no puzzle password,
 password hash, PAKE scalar, image hash, snapshot, or gameplay authentication**.
