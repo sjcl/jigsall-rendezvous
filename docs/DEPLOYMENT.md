@@ -282,8 +282,13 @@ by the remaining validity. Retries remain bounded after expiry so recovery can
 serve future peers on an initially TURN-enabled control session too. A new
 credential waits in a single retained slot if the outbound byte/message budget is
 full; it does not create an unbounded queue or
-close the room. Expiry can produce `turn_unavailable`; the client retains existing
-routes and does not interpret that event as a gameplay disconnect.
+close the room. Expiry can produce `turn_unavailable`; the client checks the latest
+default expiry and disables TURN in listener/future outgoing defaults so a new
+peer does not attempt an allocation with expired credentials. Existing routes
+retain their original configuration. The initial endpoint set stays fixed, and
+recovery re-enables future TURN when a fresh credential with that set arrives.
+An unavailable event received before the latest default expires is ignored;
+it is not a gameplay disconnect.
 
 Only `turn:host:port?transport=udp` entries are distributed (normally UDP ports 3478
 and 443). TCP/TLS entries are filtered out and credentials stay paired with their
@@ -309,12 +314,13 @@ That test verifies credential issuance only; it does not establish or bill relay
 traffic. Real Cloudflare allocation and credential expiry require separate network validation.
 
 
-TURN verification on 2026-10-05 (Windows x86_64): 42 unit and 13 WebSocket tests
+TURN verification on 2026-10-05 (Windows x86_64): 42 unit and 14 WebSocket tests
 passed; the production Cloudflare and real-Caddy checks remain opt-in. Fmt,
 all-target Clippy and the server/example builds passed. Mock HTTP verifies the
 API request and UDP credential pairing; WebSocket tests cover initial ordering,
 transient update failure, successful rotation, provider recovery, fixed initial
-availability, endpoint-set rejection and queued concurrent welcomes. The
+availability, endpoint-set rejection, queued concurrent welcomes, and expired
+defaults becoming unavailable followed by provider recovery without room closure. The
 server's `turn_fixture_server` example also passed six local cross-repository
 smoke runs using Puzzella's `run_turn_smoke.py`, including fixed allocation
 credentials during pushed-default updates, forced-relay Sync/Ready

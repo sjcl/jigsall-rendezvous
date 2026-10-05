@@ -980,3 +980,106 @@ async fn changed_rotation_endpoints_are_not_pushed_or_applied() {
     assert!(initial.same_server_set(&turn));
     f.shutdown().await;
 }
+
+#[tokio::test]
+async fn expired_turn_defaults_report_unavailable_then_recover_without_closing_room() {
+    use puzzella_rendezvous::turn::{TurnError, TurnProvider, TurnService};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+    struct Provider {
+        available: AtomicBool,
+        issued: AtomicUsize,
+    }
+    impl TurnProvider for Provider {
+        fn issue<'a>(
+            &'a self,
+            _: &'a str,
+            _: Duration,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<TurnServer>, TurnError>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                if !self.available.load(Ordering::SeqCst) {
+                    return Err(TurnError::Unavailable);
+                }
+                let n = self.issued.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![TurnServer {
+                    address: "turn.cloudflare.com:3478".into(),
+                    username: format!("user-{n}"),
+                    password: "fixture-password".into(),
+                }])
+            })
+        }
+    }
+    async fn next_turn(socket: &mut Socket) -> ServerMessage {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                match socket.next().await.unwrap().unwrap() {
+                    Message::Text(text) => break parse_server(&text).unwrap(),
+                    Message::Ping(_) => socket.flush().await.unwrap(),
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+    let provider = Arc::new(Provider {
+        available: AtomicBool::new(true),
+        issued: AtomicUsize::new(0),
+    });
+    let f = Fixture::with_server(
+        Server::new(Limits::default())
+            .with_turn(TurnService::new(provider.clone(), &turn_config())),
+    )
+    .await;
+    let (mut socket, _) = connect_async(&f.url).await.unwrap();
+    let ServerMessage::Welcome { turn: Some(a), .. } = receive(&mut socket).await else {
+        panic!("missing A")
+    };
+    assert_eq!(a.servers[0].username, "user-0");
+    send(
+        &mut socket,
+        ClientMessage::CreateRoom {
+            peer_id: PeerId([7; 16]),
+        },
+    )
+    .await;
+    assert!(matches!(
+        receive(&mut socket).await,
+        ServerMessage::RoomCreated { .. }
+    ));
+    let ServerMessage::TurnCredentials { turn: b } = next_turn(&mut socket).await else {
+        panic!("missing B")
+    };
+    assert_eq!(b.servers[0].username, "user-1");
+    assert!(b.expires_at_unix > a.expires_at_unix);
+    provider.available.store(false, Ordering::SeqCst);
+    assert!(matches!(
+        next_turn(&mut socket).await,
+        ServerMessage::TurnUnavailable {}
+    ));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(
+        now >= b.expires_at_unix,
+        "unavailable must not discard still-valid B"
+    );
+    provider.available.store(true, Ordering::SeqCst);
+    let ServerMessage::TurnCredentials { turn: c } = next_turn(&mut socket).await else {
+        panic!("missing C")
+    };
+    assert_eq!(c.servers[0].username, "user-2");
+    assert!(c.expires_at_unix > b.expires_at_unix);
+    assert!(c.same_server_set(&a));
+    send(&mut socket, ClientMessage::LeaveRoom {}).await;
+    assert!(matches!(
+        receive(&mut socket).await,
+        ServerMessage::RoomClosed {}
+    ));
+    f.shutdown().await;
+}

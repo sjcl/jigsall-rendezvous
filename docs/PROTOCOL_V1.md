@@ -232,8 +232,13 @@ Rotation requires exactly the initial endpoint address set, independent of order
 changed sets are rejected before listener defaults are mutated. Existing
 connection configuration is never replaced. These messages do not change room
 membership, SPAKE2 authentication or gameplay lifetime. Client-to-server TURN
-commands are rejected. Old/expired updates are ignored; unavailable never clears
-an installed credential or closes gameplay.
+commands are rejected. Old/expired updates are ignored. On `turn_unavailable`,
+the client checks that its latest default has expired before clearing TURN
+server/user/password defaults and disabling the Relay bit for future incoming
+and outgoing connections. Existing ICE connections keep their original values.
+The initial endpoint set and expiry watermark remain intact: a fresh credential
+with the same set re-enables TURN for future peers. An early/stale unavailable
+event cannot clear a newer, still-valid default. These events do not close gameplay.
 
 ```json
 {"v":1,"type":"turn_credentials","turn":{"expires_at_unix":2000086400,"servers":[{"address":"turn.cloudflare.com:3478","username":"short-lived-user","password":"short-lived-password"}]}}
