@@ -8,6 +8,10 @@ fallback and refreshes credentials for future peer connections through WSS.
 Existing TURN allocations keep their initial credentials.
 Direct ICE remains available when TURN is disabled or unavailable. See
 [TURN configuration and lifetime](docs/DEPLOYMENT.md#optional-cloudflare-realtime-turn).
+An optional [TURN usage budget](docs/DEPLOYMENT.md#turn-usage-budget) monitors
+Cloudflare egress for a configured billing cycle. Soft limits stop issuance and
+rotation; hard limits also revoke tracked credentials and notify TURN-enabled
+control sessions. Budget monitoring requires a small persistent registry volume.
 
 This server carries **no gameplay traffic** and accepts **no puzzle password,
 password hash, PAKE scalar, image hash, snapshot, or gameplay authentication**.
@@ -107,7 +111,7 @@ PeerUnavailable to the host. Host control disconnection deletes the room/code an
 sends RoomClosed to active and pending members. These events indicate **control
 plane unavailability**, not a request to close established GNS gameplay channels.
 The connection manager decides any explicit security revocation or pending route
-cleanup. State is memory-only; restart clears all rooms. v1 has no resume tokens,
+cleanup. Room state is memory-only; restart clears all rooms. v1 has no resume tokens,
 host reconnect or persistence.
 
 ## Resource and rate limits
@@ -166,8 +170,8 @@ delivery is best effort when a peer is slow or already gone. Clients retain
 established GNS routes independently.
 
 This server is **not STUN/TURN**. STUN endpoints and public candidates are supplied
-through Puzzella `IceConfig`; no third-party STUN endpoint is embedded. TURN,
-relay, accounts, matchmaking, public browsing, persistence and UI/runtime room
+through Puzzella `IceConfig`; no third-party STUN endpoint is embedded. TURN relay
+hosting, accounts, matchmaking, public browsing, room persistence and UI/runtime room
 integration remain outside v1.
 
 ## Validate

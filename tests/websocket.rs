@@ -818,6 +818,165 @@ async fn unavailable_provider_still_allows_direct_room_creation() {
 }
 
 #[tokio::test]
+async fn hard_budget_notifies_turn_sessions_and_preserves_direct_room_and_signaling() {
+    use puzzella_rendezvous::turn::{
+        budget::{AnalyticsBackend, BillingPeriod, BudgetConfig},
+        TurnError, TurnProvider, TurnService,
+    };
+    use std::sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    };
+    struct Analytics(AtomicU64);
+    impl AnalyticsBackend for Analytics {
+        fn usage<'a>(
+            &'a self,
+            _: BillingPeriod,
+            _: i64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, TurnError>> + Send + 'a>>
+        {
+            Box::pin(async move { Ok(self.0.load(Ordering::SeqCst)) })
+        }
+    }
+    struct Provider {
+        issues: AtomicUsize,
+        revokes: AtomicUsize,
+    }
+    impl TurnProvider for Provider {
+        fn issue<'a>(
+            &'a self,
+            _: &'a str,
+            _: Duration,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<TurnServer>, TurnError>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                let n = self.issues.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![TurnServer {
+                    address: "turn.cloudflare.com:3478".into(),
+                    username: format!("fixture-{n}"),
+                    password: "fixture-password".into(),
+                }])
+            })
+        }
+        fn revoke<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), TurnError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.revokes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let a = Arc::new(Analytics(AtomicU64::new(0)));
+    let p = Arc::new(Provider {
+        issues: AtomicUsize::new(0),
+        revokes: AtomicUsize::new(0),
+    });
+    let mut c = turn_config();
+    c.ttl = Duration::from_secs(600);
+    let service = TurnService::new(p.clone(), &c)
+        .with_budget(
+            BudgetConfig {
+                account_id: "a".repeat(32),
+                analytics_token: "fixture-analytics".into(),
+                soft_limit_bytes: 100,
+                hard_limit_bytes: 200,
+                polling_interval: Duration::from_secs(30),
+                stale_timeout: Duration::from_secs(300),
+                billing_anchor: "2020-01-17T12:00:00Z".parse().unwrap(),
+                period_seconds: None,
+                registry_path: dir.path().join("registry.jsonl"),
+            },
+            "fixture-key".into(),
+            a.clone(),
+        )
+        .await
+        .unwrap();
+    let budget = service.budget().unwrap();
+    let f = Fixture::with_server(Server::new(Limits::default()).with_turn(service)).await;
+    let (mut host, _) = connect_async(&f.url).await.unwrap();
+    assert!(matches!(
+        receive(&mut host).await,
+        ServerMessage::Welcome { turn: Some(_), .. }
+    ));
+    send(
+        &mut host,
+        ClientMessage::CreateRoom {
+            peer_id: PeerId([1; 16]),
+        },
+    )
+    .await;
+    let ServerMessage::RoomCreated { room_code, .. } = receive(&mut host).await else {
+        panic!()
+    };
+    a.0.store(200, Ordering::SeqCst);
+    budget.refresh(a.as_ref()).await;
+    assert_eq!(receive(&mut host).await, ServerMessage::TurnUnavailable {});
+    let (mut direct, _) = connect_async(&f.url).await.unwrap();
+    assert!(matches!(
+        receive(&mut direct).await,
+        ServerMessage::Welcome { turn: None, .. }
+    ));
+    assert_eq!(p.issues.load(Ordering::SeqCst), 1);
+    send(
+        &mut direct,
+        ClientMessage::JoinRoom {
+            room_code,
+            peer_id: PeerId([2; 16]),
+        },
+    )
+    .await;
+    let ServerMessage::AuthorizePeer {
+        join_id, member_id, ..
+    } = receive(&mut host).await
+    else {
+        panic!()
+    };
+    send(&mut host, ClientMessage::AuthorizeAck { join_id }).await;
+    assert!(matches!(
+        receive(&mut host).await,
+        ServerMessage::PeerJoined { .. }
+    ));
+    assert!(matches!(
+        receive(&mut direct).await,
+        ServerMessage::RoomJoined { .. }
+    ));
+    send(
+        &mut host,
+        ClientMessage::ConfirmPeer {
+            peer_id: PeerId([2; 16]),
+            member_id,
+        },
+    )
+    .await;
+    send(
+        &mut direct,
+        ClientMessage::Signal {
+            to_peer_id: PeerId([1; 16]),
+            payload_base64: "AQ==".into(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(receive(&mut host).await, ServerMessage::Signal { payload_base64, .. } if payload_base64 == "AQ==")
+    );
+    timeout(Duration::from_secs(3), async {
+        while p.revokes.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    send(&mut host, ClientMessage::LeaveRoom {}).await;
+    assert_eq!(receive(&mut host).await, ServerMessage::RoomClosed {});
+    f.shutdown().await;
+}
+
+#[tokio::test]
 async fn initial_unavailable_session_never_pushes_late_turn() {
     use puzzella_rendezvous::turn::{TurnError, TurnProvider, TurnService};
     struct Recovering(std::sync::atomic::AtomicUsize);

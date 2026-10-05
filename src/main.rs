@@ -17,10 +17,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(turn) = config.turn {
         match puzzella_rendezvous::turn::CloudflareTurnProvider::new(&turn) {
             Ok(provider) => {
-                server = server.with_turn(puzzella_rendezvous::turn::TurnService::new(
+                let mut service = puzzella_rendezvous::turn::TurnService::new(
                     std::sync::Arc::new(provider),
                     &turn,
-                ))
+                );
+                if let Some(budget) = config.turn_budget {
+                    let analytics = puzzella_rendezvous::turn::budget::CloudflareAnalytics::new(
+                        &budget,
+                        &turn.key_id,
+                    )
+                    .map_err(|_| std::io::Error::other("TURN Analytics client unavailable"))?;
+                    service = service.with_budget(budget, turn.key_id, std::sync::Arc::new(analytics)).await
+                        .map_err(|_| std::io::Error::other("TURN budget storage initialization failed; check registry path, configuration and single-writer lock"))?;
+                }
+                server = server.with_turn(service);
             }
             Err(_) => tracing::warn!("TURN unavailable; continuing with direct ICE"),
         }

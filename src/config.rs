@@ -1,10 +1,14 @@
-use crate::{turn::TurnConfig, Limits, TrustedProxies};
+use crate::{
+    turn::{budget::BudgetConfig, TurnConfig},
+    Limits, TrustedProxies,
+};
 use std::{fmt, net::SocketAddr};
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub listen: SocketAddr,
     pub turn: Option<TurnConfig>,
+    pub turn_budget: Option<BudgetConfig>,
     pub limits: Limits,
     pub trusted_proxies: TrustedProxies,
 }
@@ -119,9 +123,132 @@ impl Config {
                 ))
             }
         };
+        let enabled = read("PUZZELLA_RENDEZVOUS_TURN_BUDGET_ENABLED")?;
+        let enabled_configured = enabled.is_some();
+        let enabled = match enabled.as_deref() {
+            None | Some("false") | Some("0") => false,
+            Some("true") | Some("1") => true,
+            _ => {
+                return Err(ConfigError(
+                    "TURN_BUDGET_ENABLED: expected true/false or 1/0".into(),
+                ))
+            }
+        };
+        let required_names = [
+            "TURN_BUDGET_ACCOUNT_ID",
+            "TURN_BUDGET_ANALYTICS_TOKEN",
+            "TURN_BUDGET_SOFT_LIMIT_BYTES",
+            "TURN_BUDGET_HARD_LIMIT_BYTES",
+            "TURN_BUDGET_BILLING_ANCHOR",
+            "TURN_BUDGET_REGISTRY_PATH",
+        ];
+        let optional_names = [
+            "TURN_BUDGET_POLL_SECONDS",
+            "TURN_BUDGET_STALE_SECONDS",
+            "TURN_BUDGET_PERIOD_SECONDS",
+        ];
+        let mut budget_values = std::collections::BTreeMap::new();
+        for name in required_names.into_iter().chain(optional_names) {
+            if let Some(value) = read(&format!("PUZZELLA_RENDEZVOUS_{name}"))? {
+                budget_values.insert(name, value);
+            }
+        }
+        if !enabled && !budget_values.is_empty() && !enabled_configured {
+            return Err(ConfigError(
+                "TURN budget settings require TURN_BUDGET_ENABLED=true (or explicit false)".into(),
+            ));
+        }
+        let turn_budget = if enabled {
+            if turn.is_none() {
+                return Err(ConfigError(
+                    "TURN budget requires configured TURN credentials".into(),
+                ));
+            }
+            let required = |name| {
+                budget_values
+                    .get(name)
+                    .filter(|v| !v.is_empty())
+                    .cloned()
+                    .ok_or_else(|| {
+                        ConfigError(format!("{name}: required when TURN budget is enabled"))
+                    })
+            };
+            let account_id = required("TURN_BUDGET_ACCOUNT_ID")?;
+            if account_id.len() != 32 || !account_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(ConfigError(
+                    "TURN_BUDGET_ACCOUNT_ID: expected 32 hexadecimal characters".into(),
+                ));
+            }
+            let analytics_token = required("TURN_BUDGET_ANALYTICS_TOKEN")?;
+            if analytics_token.len() > 4096
+                || !analytics_token.bytes().all(|b| b.is_ascii_graphic())
+            {
+                return Err(ConfigError(
+                    "TURN_BUDGET_ANALYTICS_TOKEN: invalid token".into(),
+                ));
+            }
+            let number = |name, default, min, max| -> Result<u64, ConfigError> {
+                let n = budget_values
+                    .get(name)
+                    .map(|s| s.parse::<u64>())
+                    .transpose()
+                    .map_err(|_| ConfigError(format!("{name}: expected an integer")))?
+                    .or(default)
+                    .ok_or_else(|| ConfigError(format!("{name}: required")))?;
+                if !(min..=max).contains(&n) {
+                    return Err(ConfigError(format!("{name}: out of range")));
+                }
+                Ok(n)
+            };
+            let soft_limit_bytes = number("TURN_BUDGET_SOFT_LIMIT_BYTES", None, 1, u64::MAX)?;
+            let hard_limit_bytes = number("TURN_BUDGET_HARD_LIMIT_BYTES", None, 1, u64::MAX)?;
+            if soft_limit_bytes >= hard_limit_bytes {
+                return Err(ConfigError(
+                    "TURN budget requires soft limit < hard limit".into(),
+                ));
+            }
+            let poll = number("TURN_BUDGET_POLL_SECONDS", Some(30), 1, 3600)?;
+            let stale = number("TURN_BUDGET_STALE_SECONDS", Some(300), 1, 86400)?;
+            if stale <= poll {
+                return Err(ConfigError(
+                    "TURN budget stale timeout must exceed polling interval".into(),
+                ));
+            }
+            let billing_anchor =
+                chrono::DateTime::parse_from_rfc3339(&required("TURN_BUDGET_BILLING_ANCHOR")?)
+                    .map_err(|_| {
+                        ConfigError("TURN_BUDGET_BILLING_ANCHOR: expected RFC3339".into())
+                    })?
+                    .with_timezone(&chrono::Utc);
+            if billing_anchor.timestamp_subsec_nanos() != 0
+                || !(1970..=9998).contains(&chrono::Datelike::year(&billing_anchor))
+            {
+                return Err(ConfigError(
+                    "TURN_BUDGET_BILLING_ANCHOR: expected whole seconds, year 1970..9998".into(),
+                ));
+            }
+            let period_seconds = budget_values
+                .get("TURN_BUDGET_PERIOD_SECONDS")
+                .map(|_| number("TURN_BUDGET_PERIOD_SECONDS", None, 60, 366 * 86400))
+                .transpose()?;
+            Some(BudgetConfig {
+                account_id,
+                analytics_token,
+                soft_limit_bytes,
+                hard_limit_bytes,
+                polling_interval: std::time::Duration::from_secs(poll),
+                stale_timeout: std::time::Duration::from_secs(stale),
+                billing_anchor,
+                period_seconds,
+                registry_path: required("TURN_BUDGET_REGISTRY_PATH")?.into(),
+            })
+        } else {
+            None
+        };
         Ok(Self {
             listen,
             turn,
+            turn_budget,
             limits,
             trusted_proxies,
         })
@@ -190,6 +317,68 @@ mod tests {
             bad.push((key, value));
             assert!(config(&bad).is_err());
         }
+    }
+    #[test]
+    fn budget_configuration_requires_complete_consistent_settings_and_redacts_tokens() {
+        let mut values = vec![
+            ("PUZZELLA_RENDEZVOUS_TURN_KEY_ID", "key"),
+            ("PUZZELLA_RENDEZVOUS_TURN_API_TOKEN", "private-turn-token"),
+            ("PUZZELLA_RENDEZVOUS_TURN_BUDGET_ENABLED", "true"),
+            (
+                "PUZZELLA_RENDEZVOUS_TURN_BUDGET_ACCOUNT_ID",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            (
+                "PUZZELLA_RENDEZVOUS_TURN_BUDGET_ANALYTICS_TOKEN",
+                "private-analytics-token",
+            ),
+            ("PUZZELLA_RENDEZVOUS_TURN_BUDGET_SOFT_LIMIT_BYTES", "100"),
+            ("PUZZELLA_RENDEZVOUS_TURN_BUDGET_HARD_LIMIT_BYTES", "200"),
+            (
+                "PUZZELLA_RENDEZVOUS_TURN_BUDGET_BILLING_ANCHOR",
+                "2026-01-17T12:00:00+09:00",
+            ),
+            (
+                "PUZZELLA_RENDEZVOUS_TURN_BUDGET_REGISTRY_PATH",
+                "registry.jsonl",
+            ),
+        ];
+        let c = config(&values).unwrap();
+        let b = c.turn_budget.as_ref().unwrap();
+        assert_eq!(b.polling_interval.as_secs(), 30);
+        assert_eq!(b.stale_timeout.as_secs(), 300);
+        assert_eq!(b.billing_anchor.to_rfc3339(), "2026-01-17T03:00:00+00:00");
+        assert!(!format!("{c:?}").contains("private-"));
+        for index in 0..values.len() {
+            let mut missing = values.clone();
+            missing.remove(index);
+            assert!(config(&missing).is_err());
+        }
+        for (key, invalid) in [
+            ("PUZZELLA_RENDEZVOUS_TURN_BUDGET_ENABLED", "yes"),
+            ("PUZZELLA_RENDEZVOUS_TURN_BUDGET_ACCOUNT_ID", "invalid"),
+            (
+                "PUZZELLA_RENDEZVOUS_TURN_BUDGET_ANALYTICS_TOKEN",
+                "invalid token",
+            ),
+            ("PUZZELLA_RENDEZVOUS_TURN_BUDGET_SOFT_LIMIT_BYTES", "200"),
+            ("PUZZELLA_RENDEZVOUS_TURN_BUDGET_HARD_LIMIT_BYTES", "0"),
+            ("PUZZELLA_RENDEZVOUS_TURN_BUDGET_POLL_SECONDS", "0"),
+            ("PUZZELLA_RENDEZVOUS_TURN_BUDGET_STALE_SECONDS", "30"),
+            (
+                "PUZZELLA_RENDEZVOUS_TURN_BUDGET_BILLING_ANCHOR",
+                "2026-01-01",
+            ),
+            ("PUZZELLA_RENDEZVOUS_TURN_BUDGET_PERIOD_SECONDS", "0"),
+        ] {
+            let mut bad = values.clone();
+            bad.retain(|(k, _)| *k != key);
+            bad.push((key, invalid));
+            assert!(config(&bad).is_err());
+        }
+        values[2].1 = "false";
+        assert!(config(&values).unwrap().turn_budget.is_none());
+        assert!(config(&[]).unwrap().turn_budget.is_none());
     }
     #[test]
     fn invalid_configuration_fails_before_binding() {
