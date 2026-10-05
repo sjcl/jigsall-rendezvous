@@ -690,3 +690,129 @@ async fn caddy_edge_replaces_spoofed_ip_and_relays_ordered_activation() {
     host.close(None).await.unwrap();
     joiner.close(None).await.unwrap();
 }
+
+struct RotatingProvider(std::sync::atomic::AtomicUsize);
+impl puzzella_rendezvous::turn::TurnProvider for RotatingProvider {
+    fn issue<'a>(
+        &'a self,
+        identifier: &'a str,
+        _: Duration,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Vec<TurnServer>, puzzella_rendezvous::turn::TurnError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            assert_eq!(identifier.len(), 32);
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 1 {
+                return Err(puzzella_rendezvous::turn::TurnError::Unavailable);
+            }
+            Ok(vec![TurnServer {
+                address: "turn.cloudflare.com:3478".into(),
+                username: format!("user-{n}"),
+                password: "short-lived-password".into(),
+            }])
+        })
+    }
+}
+fn turn_config() -> puzzella_rendezvous::turn::TurnConfig {
+    puzzella_rendezvous::turn::TurnConfig {
+        key_id: "server-key".into(),
+        api_token: "server-token".into(),
+        ttl: Duration::from_secs(4),
+        concurrency: 1,
+        requests_per_minute: 60,
+    }
+}
+#[tokio::test]
+async fn welcome_precedes_room_creation_and_rotation_retries_without_changing_room() {
+    use puzzella_rendezvous::turn::TurnService;
+    let p = std::sync::Arc::new(RotatingProvider(std::sync::atomic::AtomicUsize::new(0)));
+    let f = Fixture::with_server(
+        Server::new(Limits::default()).with_turn(TurnService::new(p.clone(), &turn_config())),
+    )
+    .await;
+    let (mut socket, _) = connect_async(&f.url).await.unwrap();
+    let ServerMessage::Welcome {
+        turn: Some(initial),
+        ..
+    } = receive(&mut socket).await
+    else {
+        panic!("missing initial TURN");
+    };
+    assert_eq!(initial.servers[0].username, "user-0");
+    send(
+        &mut socket,
+        ClientMessage::CreateRoom {
+            peer_id: PeerId([7; 16]),
+        },
+    )
+    .await;
+    assert!(matches!(
+        receive(&mut socket).await,
+        ServerMessage::RoomCreated { .. }
+    ));
+    let ServerMessage::TurnCredentials { turn } = timeout(Duration::from_secs(5), async {
+        loop {
+            match socket.next().await.unwrap().unwrap() {
+                Message::Text(text) => break parse_server(&text).unwrap(),
+                Message::Ping(_) => socket.flush().await.unwrap(),
+                _ => panic!(),
+            }
+        }
+    })
+    .await
+    .unwrap() else {
+        panic!("rotation missing");
+    };
+    assert_eq!(turn.servers[0].username, "user-2");
+    assert!(turn.expires_at_unix > initial.expires_at_unix);
+    send(&mut socket, ClientMessage::LeaveRoom {}).await;
+    assert!(matches!(
+        receive(&mut socket).await,
+        ServerMessage::RoomClosed {}
+    ));
+    f.shutdown().await;
+}
+#[tokio::test]
+async fn unavailable_provider_still_allows_direct_room_creation() {
+    use puzzella_rendezvous::turn::{TurnError, TurnProvider, TurnService};
+    struct Unavailable;
+    impl TurnProvider for Unavailable {
+        fn issue<'a>(
+            &'a self,
+            _: &'a str,
+            _: Duration,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<TurnServer>, TurnError>> + Send + 'a>,
+        > {
+            Box::pin(async { Err(TurnError::Unavailable) })
+        }
+    }
+    let f = Fixture::with_server(Server::new(Limits::default()).with_turn(TurnService::new(
+        std::sync::Arc::new(Unavailable),
+        &turn_config(),
+    )))
+    .await;
+    let (mut socket, _) = connect_async(&f.url).await.unwrap();
+    assert!(matches!(
+        receive(&mut socket).await,
+        ServerMessage::Welcome { turn: None, .. }
+    ));
+    send(
+        &mut socket,
+        ClientMessage::CreateRoom {
+            peer_id: PeerId([8; 16]),
+        },
+    )
+    .await;
+    assert!(matches!(
+        receive(&mut socket).await,
+        ServerMessage::RoomCreated { .. }
+    ));
+    f.shutdown().await;
+}

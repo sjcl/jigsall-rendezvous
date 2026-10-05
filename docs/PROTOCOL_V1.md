@@ -217,3 +217,26 @@ schema and fixtures must be updated together. Field order has no semantic meanin
 ```json
 {"v":1,"type":"error","code":"join_timeout"}
 ```
+
+## TURN credential extension (v1)
+
+Welcome optionally contains `turn`; omission means TURN unavailable/disabled and
+permits direct ICE. The initial value is available before CreateRoom/JoinRoom and
+before any GNS peer connection. The server subsequently pushes `turn_credentials`
+and may push `turn_unavailable` after expiry. Neither changes room membership,
+SPAKE2 authentication or gameplay lifetime. Client-to-server TURN commands are
+rejected. Old/expired updates are ignored; unavailable never clears an installed
+credential or closes gameplay.
+
+```json
+{"v":1,"type":"turn_credentials","turn":{"expires_at_unix":2000086400,"servers":[{"address":"turn.cloudflare.com:3478","username":"short-lived-user","password":"short-lived-password"}]}}
+```
+
+`expires_at_unix` is the conservative issuance-start Unix time plus the requested
+TTL; Cloudflare does not include expiry in its response. `servers` has 1–4 unique
+UDP `host:port` entries. Address, username and password are each at most 256 bytes;
+credentials are printable ASCII without commas/NUL. Strings are not configuration
+URLs: TCP/TLS selection and list expansion are not supported. Typed validation and
+the 24-KiB WSS limit apply. Debug redacts credentials and parsing errors never quote
+the frame. Provider keys/tokens are absent from this schema. Golden fixtures and
+Rust definitions are mirrored in the game repository.

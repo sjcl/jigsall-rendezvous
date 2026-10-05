@@ -13,7 +13,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .init();
     let config = Config::from_env()?;
-    let server = Server::with_trusted_proxies(config.limits, config.trusted_proxies);
+    let mut server = Server::with_trusted_proxies(config.limits, config.trusted_proxies);
+    if let Some(turn) = config.turn {
+        match puzzella_rendezvous::turn::CloudflareTurnProvider::new(&turn) {
+            Ok(provider) => {
+                server = server.with_turn(puzzella_rendezvous::turn::TurnService::new(
+                    std::sync::Arc::new(provider),
+                    &turn,
+                ))
+            }
+            Err(_) => tracing::warn!("TURN unavailable; continuing with direct ICE"),
+        }
+    }
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     tracing::info!(listen = %listener.local_addr()?, "rendezvous v1 listening");
     serve(listener, server, async {

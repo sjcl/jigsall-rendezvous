@@ -284,6 +284,7 @@ impl State {
             id,
             ServerMessage::Welcome {
                 authority_id: self.authority,
+                turn: None,
             },
         );
         e
