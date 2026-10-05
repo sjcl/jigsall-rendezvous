@@ -184,6 +184,7 @@ impl TurnService {
         }
         Ok(turn)
     }
+    // Publish future-connection defaults, never replace active allocation credentials.
     pub(crate) async fn rotate(
         &self,
         identifier: String,

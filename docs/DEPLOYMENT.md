@@ -269,7 +269,14 @@ Only sessions whose Welcome contains usable TURN start rotation. The endpoint
 address set must remain equal to Welcome's set (ordering may change). An endpoint
 addition/removal/change is an invalid rotation response; it is never pushed or
 partially applied, and the current credentials are retained during retry.
-Rotation starts at half the TTL (about 12 hours for the default). Failures retain
+Pushed credentials update host listener / future outgoing connection defaults
+only. Existing ICE connections keep the credentials with which they initialized:
+Refresh, CreatePermission and reallocation continue with A after defaults become B.
+This follows [RFC 8656 sections 5/6](https://www.rfc-editor.org/rfc/rfc8656.html#section-5);
+a different valid username on an existing allocation receives 441 Wrong Credentials.
+No native API replaces active allocation credentials.
+
+Default refresh starts at half the TTL (about 12 hours for the default). Failures retain
 the old credential and retry with 1–60 second bounded exponential backoff, capped
 by the remaining validity. Retries remain bounded after expiry so recovery can
 serve future peers on an initially TURN-enabled control session too. A new
@@ -286,16 +293,20 @@ relay only when the selected route requires it.
 
 WSS control loss cancels issuance/rotation for that socket. Existing GNS,
 SecureTransport, SPAKE2, Sync/Ready and gameplay state continue independently.
-A TURN-only route can eventually fail if no credentials arrive before expiry;
-Rendezvous reconnect/resume is outside this implementation. Cloudflare's
-[TURN FAQ](https://developers.cloudflare.com/realtime/turn/faq/) documents the
-48-hour credential maximum and the need for fresh credentials on long allocations.
+An existing TURN-only route can fail when its original credential expires, even
+if newer defaults keep arriving over WSS. Choose a TTL for the expected peer
+connection duration (default 24 hours, configurable up to 48 hours); a connection
+inherits the credential's remaining validity from issuance, not a fresh TTL.
+ICE restart /
+allocation migration and Rendezvous reconnect/resume are outside this implementation.
+Cloudflare's [TURN FAQ](https://developers.cloudflare.com/realtime/turn/faq/)
+documents the maximum TTL, expiry behavior and ICE restart recommendation.
 
 Normal CI uses mock HTTP/providers and a local TURN fixture, never production
 Cloudflare. To check real issuance manually, configure the secrets explicitly and
 run `cargo test --locked cloudflare_manual_credential_issue -- --ignored`.
 That test verifies credential issuance only; it does not establish or bill relay
-traffic. Real Cloudflare allocation/rotation requires separate network validation.
+traffic. Real Cloudflare allocation and credential expiry require separate network validation.
 
 
 TURN verification on 2026-10-05 (Windows x86_64): 42 unit and 13 WebSocket tests
@@ -305,7 +316,10 @@ API request and UDP credential pairing; WebSocket tests cover initial ordering,
 transient update failure, successful rotation, provider recovery, fixed initial
 availability, endpoint-set rejection and queued concurrent welcomes. The
 server's `turn_fixture_server` example also passed six local cross-repository
-smoke runs using Puzzella's `run_turn_smoke.py`, including forced-relay Sync/Ready
+smoke runs using Puzzella's `run_turn_smoke.py`, including fixed allocation
+credentials during pushed-default updates, forced-relay Sync/Ready
 and encrypted traffic after control shutdown, plus initially unavailable sessions
 remaining direct-only after mock API recovery. This uses loopback WS and a local
-UDP relay, with no production API requests.
+UDP relay, with no production API requests. Fixture keys are static and provider
+metadata TTLs are accelerated; this does not validate actual credential expiry,
+48-hour sessions or ICE restart recovery.
