@@ -222,9 +222,13 @@ schema and fixtures must be updated together. Field order has no semantic meanin
 
 Welcome optionally contains `turn`; omission means TURN unavailable/disabled and
 permits direct ICE. The initial value is available before CreateRoom/JoinRoom and
-before any GNS peer connection. The server subsequently pushes `turn_credentials`
-and may push `turn_unavailable` after expiry. Neither changes room membership,
-SPAKE2 authentication or gameplay lifetime. Client-to-server TURN commands are
+before any GNS peer connection. Only sessions with TURN in Welcome subsequently
+receive `turn_credentials` and possibly `turn_unavailable` after expiry. An omitted initial value fixes this
+entire WSS session to direct-only; later credentials are not issued or installed.
+Rotation requires exactly the initial endpoint address set, independent of order;
+changed sets are rejected before any native configuration is mutated. These
+messages do not change room membership, SPAKE2 authentication or gameplay
+lifetime. Client-to-server TURN commands are
 rejected. Old/expired updates are ignored; unavailable never clears an installed
 credential or closes gameplay.
 

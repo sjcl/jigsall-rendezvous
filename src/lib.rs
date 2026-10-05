@@ -201,7 +201,9 @@ async fn session(
         }
         effects
     });
-    let _rotation = server.turn.clone().map(|service| {
+    // Welcome fixes this control session's relay topology before peer ICE starts.
+    // Native ICE cannot add TURN to an already initialized direct-only session.
+    let _rotation = server.turn.clone().zip(initial).map(|(service, initial)| {
         let tx = lease.turn_tx.clone();
         turn::Rotation(tokio::spawn(async move {
             service.rotate(identifier, tx, initial).await

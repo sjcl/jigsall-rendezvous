@@ -17,7 +17,8 @@ use std::{
 struct Provider {
     address: String,
     count: AtomicUsize,
-    unavailable: bool,
+    mode: String,
+    recovered_at: std::time::Instant,
 }
 impl TurnProvider for Provider {
     fn issue<'a>(
@@ -26,7 +27,9 @@ impl TurnProvider for Provider {
         _: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<TurnServer>, TurnError>> + Send + 'a>> {
         Box::pin(async move {
-            if self.unavailable {
+            if self.mode == "unavailable"
+                || (self.mode == "recovering" && std::time::Instant::now() < self.recovered_at)
+            {
                 return Err(TurnError::Unavailable);
             }
             let version = if self.count.fetch_add(1, Ordering::SeqCst) < 2 {
@@ -58,7 +61,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(Provider {
             address,
             count: AtomicUsize::new(0),
-            unavailable: std::env::args().nth(2).is_some_and(|v| v == "unavailable"),
+            mode: std::env::args().nth(2).unwrap_or_default(),
+            recovered_at: std::time::Instant::now() + Duration::from_secs(2),
         }),
         &config,
     ));

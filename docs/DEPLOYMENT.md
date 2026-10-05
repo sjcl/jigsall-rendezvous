@@ -253,18 +253,28 @@ certificates for that outbound connection; Caddy still terminates inbound WSS.
 
 Set both key variables or neither. Invalid/partial settings fail before binding,
 with secret-free diagnostics. TURN disabled or provider/network/rate-limit failure
-still produces Welcome and permits STUN/direct ICE. An initial HTTP call has a
-three-second deadline. Only admitted WebSockets can cause issuance; there is no
-client refresh command or publicly exposed credential HTTP endpoint. Existing
+still produces Welcome and permits STUN/direct ICE. One three-second deadline
+covers both waiting for the shared concurrency permit and the HTTP call; a busy
+permit waits within this budget instead of immediately disabling TURN. A global
+issuance-rate rejection or deadline/provider failure still permits direct ICE.
+Welcome without TURN fixes that entire WSS session (including future peers) to
+direct-only: no background retries or later TURN push start. A newly opened control
+session can receive initial credentials after the provider recovers. Only admitted
+WebSockets can cause issuance; there is no client refresh command or publicly exposed credential HTTP endpoint. Existing
 IP/admission/resource limits apply in addition to the shared issuance quota and
 concurrency bound. Each socket has a random 128-bit `customIdentifier`, unrelated
 to IP, room, password or player identity, retained across its credential updates.
 
+Only sessions whose Welcome contains usable TURN start rotation. The endpoint
+address set must remain equal to Welcome's set (ordering may change). An endpoint
+addition/removal/change is an invalid rotation response; it is never pushed or
+partially applied, and the current credentials are retained during retry.
 Rotation starts at half the TTL (about 12 hours for the default). Failures retain
 the old credential and retry with 1–60 second bounded exponential backoff, capped
 by the remaining validity. Retries remain bounded after expiry so recovery can
-serve future peers too. A new credential waits in a single retained slot if the
-outbound byte/message budget is full; it does not create an unbounded queue or
+serve future peers on an initially TURN-enabled control session too. A new
+credential waits in a single retained slot if the outbound byte/message budget is
+full; it does not create an unbounded queue or
 close the room. Expiry can produce `turn_unavailable`; the client retains existing
 routes and does not interpret that event as a gameplay disconnect.
 
@@ -288,12 +298,14 @@ That test verifies credential issuance only; it does not establish or bill relay
 traffic. Real Cloudflare allocation/rotation requires separate network validation.
 
 
-TURN verification on 2026-10-05 (Windows x86_64): 40 unit and 10 WebSocket tests
+TURN verification on 2026-10-05 (Windows x86_64): 42 unit and 13 WebSocket tests
 passed; the production Cloudflare and real-Caddy checks remain opt-in. Fmt,
 all-target Clippy and the server/example builds passed. Mock HTTP verifies the
 API request and UDP credential pairing; WebSocket tests cover initial ordering,
-transient update failure, successful rotation and provider unavailability. The
-server's `turn_fixture_server` example also passed four local cross-repository
+transient update failure, successful rotation, provider recovery, fixed initial
+availability, endpoint-set rejection and queued concurrent welcomes. The
+server's `turn_fixture_server` example also passed six local cross-repository
 smoke runs using Puzzella's `run_turn_smoke.py`, including forced-relay Sync/Ready
-and encrypted traffic after control shutdown. This uses loopback WS and a local
+and encrypted traffic after control shutdown, plus initially unavailable sessions
+remaining direct-only after mock API recovery. This uses loopback WS and a local
 UDP relay, with no production API requests.

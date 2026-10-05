@@ -816,3 +816,167 @@ async fn unavailable_provider_still_allows_direct_room_creation() {
     ));
     f.shutdown().await;
 }
+
+#[tokio::test]
+async fn initial_unavailable_session_never_pushes_late_turn() {
+    use puzzella_rendezvous::turn::{TurnError, TurnProvider, TurnService};
+    struct Recovering(std::sync::atomic::AtomicUsize);
+    impl TurnProvider for Recovering {
+        fn issue<'a>(
+            &'a self,
+            _: &'a str,
+            _: Duration,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<TurnServer>, TurnError>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    Err(TurnError::Unavailable)
+                } else {
+                    Ok(vec![TurnServer {
+                        address: "turn.cloudflare.com:3478".into(),
+                        username: "recovered".into(),
+                        password: "fixture".into(),
+                    }])
+                }
+            })
+        }
+    }
+    let provider = std::sync::Arc::new(Recovering(std::sync::atomic::AtomicUsize::new(0)));
+    let f = Fixture::with_server(
+        Server::new(Limits::default())
+            .with_turn(TurnService::new(provider.clone(), &turn_config())),
+    )
+    .await;
+    let (mut socket, _) = connect_async(&f.url).await.unwrap();
+    assert!(matches!(
+        receive(&mut socket).await,
+        ServerMessage::Welcome { turn: None, .. }
+    ));
+    send(
+        &mut socket,
+        ClientMessage::CreateRoom {
+            peer_id: PeerId([9; 16]),
+        },
+    )
+    .await;
+    assert!(matches!(
+        receive(&mut socket).await,
+        ServerMessage::RoomCreated { .. }
+    ));
+    assert!(timeout(Duration::from_millis(1300), socket.next())
+        .await
+        .is_err());
+    assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let (mut future, _) = connect_async(&f.url).await.unwrap();
+    assert!(matches!(
+        receive(&mut future).await,
+        ServerMessage::Welcome { turn: Some(_), .. }
+    ));
+    send(&mut socket, ClientMessage::LeaveRoom {}).await;
+    assert!(matches!(
+        receive(&mut socket).await,
+        ServerMessage::RoomClosed {}
+    ));
+    f.shutdown().await;
+}
+#[tokio::test]
+async fn concurrent_welcomes_wait_instead_of_becoming_direct_only() {
+    use puzzella_rendezvous::turn::{TurnError, TurnProvider, TurnService};
+    struct Slow;
+    impl TurnProvider for Slow {
+        fn issue<'a>(
+            &'a self,
+            _: &'a str,
+            _: Duration,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<TurnServer>, TurnError>> + Send + 'a>,
+        > {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(vec![TurnServer {
+                    address: "turn.cloudflare.com:3478".into(),
+                    username: "fixture".into(),
+                    password: "fixture".into(),
+                }])
+            })
+        }
+    }
+    let f = Fixture::with_server(
+        Server::new(Limits::default())
+            .with_turn(TurnService::new(std::sync::Arc::new(Slow), &turn_config())),
+    )
+    .await;
+    let attempts = (0..6).map(|_| {
+        let url = f.url.clone();
+        async move {
+            let (mut socket, _) = connect_async(&url).await.unwrap();
+            assert!(matches!(
+                receive(&mut socket).await,
+                ServerMessage::Welcome { turn: Some(_), .. }
+            ));
+            socket
+        }
+    });
+    let sockets = futures_util::future::join_all(attempts).await;
+    assert_eq!(sockets.len(), 6);
+    f.shutdown().await;
+}
+#[tokio::test]
+async fn changed_rotation_endpoints_are_not_pushed_or_applied() {
+    use puzzella_rendezvous::turn::{TurnError, TurnProvider, TurnService};
+    struct Changing(std::sync::atomic::AtomicUsize);
+    impl TurnProvider for Changing {
+        fn issue<'a>(
+            &'a self,
+            _: &'a str,
+            _: Duration,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<TurnServer>, TurnError>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec![TurnServer {
+                    address: if n == 1 {
+                        "changed.example:3478"
+                    } else {
+                        "turn.cloudflare.com:3478"
+                    }
+                    .into(),
+                    username: format!("user-{n}"),
+                    password: "fixture".into(),
+                }])
+            })
+        }
+    }
+    let f = Fixture::with_server(Server::new(Limits::default()).with_turn(TurnService::new(
+        std::sync::Arc::new(Changing(std::sync::atomic::AtomicUsize::new(0))),
+        &turn_config(),
+    )))
+    .await;
+    let (mut socket, _) = connect_async(&f.url).await.unwrap();
+    let ServerMessage::Welcome {
+        turn: Some(initial),
+        ..
+    } = receive(&mut socket).await
+    else {
+        panic!("missing TURN")
+    };
+    let ServerMessage::TurnCredentials { turn } = timeout(Duration::from_secs(5), async {
+        loop {
+            match socket.next().await.unwrap().unwrap() {
+                Message::Text(text) => break parse_server(&text).unwrap(),
+                Message::Ping(_) => socket.flush().await.unwrap(),
+                _ => panic!("unexpected frame"),
+            }
+        }
+    })
+    .await
+    .unwrap() else {
+        panic!("missing accepted rotation")
+    };
+    assert_eq!(turn.servers[0].username, "user-2");
+    assert!(initial.same_server_set(&turn));
+    f.shutdown().await;
+}

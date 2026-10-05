@@ -157,18 +157,23 @@ impl TurnService {
         }
     }
     pub(crate) async fn issue(&self, identifier: &str) -> Result<TurnCredentials, TurnError> {
-        let _permit = self.permits.try_acquire().map_err(|_| TurnError::Limited)?;
+        // One deadline covers both admission waiting and external HTTP I/O.
+        tokio::time::timeout(Duration::from_secs(3), self.issue_admitted(identifier))
+            .await
+            .map_err(|_| TurnError::Unavailable)?
+    }
+    async fn issue_admitted(&self, identifier: &str) -> Result<TurnCredentials, TurnError> {
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| TurnError::Unavailable)?;
         if !self.rate.lock().unwrap().take(Instant::now()) {
             return Err(TurnError::Limited);
         }
         // Start the TTL clock before HTTP I/O so latency cannot extend validity locally.
         let issued = unix_now();
-        let servers = tokio::time::timeout(
-            Duration::from_secs(3),
-            self.provider.issue(identifier, self.ttl),
-        )
-        .await
-        .map_err(|_| TurnError::Unavailable)??;
+        let servers = self.provider.issue(identifier, self.ttl).await?;
         let turn = TurnCredentials {
             expires_at_unix: issued + self.ttl.as_secs(),
             servers,
@@ -183,19 +188,22 @@ impl TurnService {
         &self,
         identifier: String,
         tx: outbound::Sender,
-        initial: Option<TurnCredentials>,
+        initial: TurnCredentials,
     ) {
         let mut current = initial;
-        let mut delay = if current.is_some() {
-            self.ttl / 2
-        } else {
-            Duration::from_secs(1)
-        };
+        let mut delay = self.ttl / 2;
         let mut backoff = Duration::from_secs(1);
         let mut expiry_reported = false;
         loop {
             tokio::time::sleep(delay).await;
-            match self.issue(&identifier).await {
+            let update = self.issue(&identifier).await.and_then(|turn| {
+                if current.same_server_set(&turn) {
+                    Ok(turn)
+                } else {
+                    Err(TurnError::InvalidResponse)
+                }
+            });
+            match update {
                 Ok(turn) => {
                     // Keep one newly issued value while a bounded outbound queue is full.
                     // Do not mint another credential or close a room because of TURN pressure.
@@ -209,7 +217,7 @@ impl TurnService {
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                     if unix_now() < turn.expires_at_unix {
-                        current = Some(turn);
+                        current = turn;
                         expiry_reported = false;
                         backoff = Duration::from_secs(1);
                         delay = self.ttl / 2;
@@ -219,18 +227,11 @@ impl TurnService {
                 }
                 Err(_) => {
                     // An update failure never replaces the client's valid credential.
-                    if current
-                        .as_ref()
-                        .is_some_and(|c| unix_now() >= c.expires_at_unix)
-                        && !expiry_reported
-                    {
+                    if unix_now() >= current.expires_at_unix && !expiry_reported {
                         expiry_reported = tx.try_send(ServerMessage::TurnUnavailable {}).is_ok();
                     }
                     delay = backoff;
-                    if let Some(remaining) = current
-                        .as_ref()
-                        .and_then(|c| c.expires_at_unix.checked_sub(unix_now()))
-                    {
+                    if let Some(remaining) = current.expires_at_unix.checked_sub(unix_now()) {
                         delay = delay.min(Duration::from_secs(remaining.max(1)));
                     }
                     backoff = (backoff * 2).min(Duration::from_secs(60));

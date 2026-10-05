@@ -102,6 +102,14 @@ pub struct TurnCredentials {
     pub servers: Vec<TurnServer>,
 }
 impl TurnCredentials {
+    /// Rotation changes credentials, never the initially configured endpoint set.
+    pub fn same_server_set(&self, other: &Self) -> bool {
+        self.servers.len() == other.servers.len()
+            && self
+                .servers
+                .iter()
+                .all(|s| other.servers.iter().any(|o| o.address == s.address))
+    }
     pub fn validate(&self) -> Result<(), ErrorCode> {
         if self.expires_at_unix == 0 || self.servers.is_empty() || self.servers.len() > 4 {
             return Err(ErrorCode::InvalidMessage);

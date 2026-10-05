@@ -64,25 +64,83 @@ async fn global_rate_limit_and_debug_redaction() {
     }
 }
 #[tokio::test]
-async fn concurrency_is_bounded_and_cancellation_releases_permit() {
-    struct Hanging;
-    impl TurnProvider for Hanging {
+async fn concurrency_waits_for_a_permit_and_cancellation_releases_it() {
+    let mut c = config();
+    c.requests_per_minute = 100;
+    let provider = Arc::new(Provider(AtomicUsize::new(0)));
+    let service = TurnService::new(provider.clone(), &c);
+    let held = service.permits.acquire().await.unwrap();
+    let copy = service.clone();
+    let waiting = tokio::spawn(async move { copy.issue("waiting").await });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(!waiting.is_finished());
+    assert_eq!(provider.0.load(Ordering::SeqCst), 0);
+    drop(held);
+    assert!(waiting.await.unwrap().is_ok());
+    assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+
+    let held = service.permits.acquire().await.unwrap();
+    let copy = service.clone();
+    let waiting = tokio::spawn(async move { copy.issue("cancelled").await });
+    tokio::task::yield_now().await;
+    waiting.abort();
+    let _ = waiting.await;
+    drop(held);
+    assert_eq!(service.permits.available_permits(), 1);
+    assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+}
+#[tokio::test]
+async fn issuance_deadline_includes_permit_wait_and_http() {
+    struct Slow;
+    impl TurnProvider for Slow {
         fn issue<'a>(
             &'a self,
             _: &'a str,
             _: Duration,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<TurnServer>, TurnError>> + Send + 'a>> {
-            Box::pin(std::future::pending())
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                Err(TurnError::InvalidResponse)
+            })
         }
     }
-    let service = TurnService::new(Arc::new(Hanging), &config());
-    let copy = service.clone();
-    let task = tokio::spawn(async move { copy.issue("one").await });
-    tokio::task::yield_now().await;
-    assert_eq!(service.issue("two").await, Err(TurnError::Limited));
-    task.abort();
-    let _ = task.await;
+    let service = TurnService::new(Arc::new(Slow), &config());
+    let held = service.permits.clone().acquire_owned().await.unwrap();
+    let releasing = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        drop(held);
+    });
+    let start = Instant::now();
+    assert_eq!(service.issue("one").await, Err(TurnError::Unavailable));
+    assert!(start.elapsed() < Duration::from_millis(3400));
+    releasing.await.unwrap();
     assert_eq!(service.permits.available_permits(), 1);
+}
+#[test]
+fn rotation_endpoint_set_is_order_independent_and_exact() {
+    let initial = TurnCredentials {
+        expires_at_unix: 1,
+        servers: vec![
+            TurnServer {
+                address: "one.example:3478".into(),
+                username: "A".into(),
+                password: "A".into(),
+            },
+            TurnServer {
+                address: "two.example:443".into(),
+                username: "A".into(),
+                password: "A".into(),
+            },
+        ],
+    };
+    let mut next = initial.clone();
+    next.servers.reverse();
+    next.servers[0].password = "B".into();
+    assert!(initial.same_server_set(&next));
+    next.servers[1].address = "changed.example:3478".into();
+    assert!(!initial.same_server_set(&next));
+    next.servers.pop();
+    assert!(!initial.same_server_set(&next));
 }
 
 #[tokio::test]
