@@ -1,28 +1,28 @@
-use puzzella_rendezvous::{serve, Config, Server};
+use jigsall_rendezvous::{serve, Config, Server};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Restrict logging to our own target. Dependency trace logs can include
     // WebSocket frame contents; RUST_LOG must not enable those in this server.
-    let level = std::env::var("PUZZELLA_RENDEZVOUS_LOG")
+    let level = std::env::var("JIGSALL_RENDEZVOUS_LOG")
         .unwrap_or_else(|_| "info".into())
         .parse::<tracing_subscriber::filter::LevelFilter>()?;
     use tracing_subscriber::prelude::*;
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_filter(
-            tracing_subscriber::filter::Targets::new().with_target("puzzella_rendezvous", level),
+            tracing_subscriber::filter::Targets::new().with_target("jigsall_rendezvous", level),
         ))
         .init();
     let config = Config::from_env()?;
     let mut server = Server::with_trusted_proxies(config.limits, config.trusted_proxies);
     if let Some(turn) = config.turn {
-        match puzzella_rendezvous::turn::CloudflareTurnProvider::new(&turn) {
+        match jigsall_rendezvous::turn::CloudflareTurnProvider::new(&turn) {
             Ok(provider) => {
-                let mut service = puzzella_rendezvous::turn::TurnService::new(
+                let mut service = jigsall_rendezvous::turn::TurnService::new(
                     std::sync::Arc::new(provider),
                     &turn,
                 );
                 if let Some(budget) = config.turn_budget {
-                    let analytics = puzzella_rendezvous::turn::budget::CloudflareAnalytics::new(
+                    let analytics = jigsall_rendezvous::turn::budget::CloudflareAnalytics::new(
                         &budget,
                         &turn.key_id,
                     )

@@ -1,5 +1,5 @@
 //! Manual cross-repository harness; never loads or requests production secrets.
-use puzzella_rendezvous::{
+use jigsall_rendezvous::{
     protocol::TurnServer,
     serve,
     turn::{TurnConfig, TurnError, TurnProvider, TurnService},

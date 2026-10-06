@@ -1,5 +1,5 @@
 use futures_util::{SinkExt, StreamExt};
-use puzzella_rendezvous::{protocol::*, serve, Limits, Server};
+use jigsall_rendezvous::{protocol::*, serve, Limits, Server};
 use std::time::Duration;
 use tokio::{net::TcpListener, sync::oneshot, time::timeout};
 use tokio_tungstenite::{
@@ -597,7 +597,7 @@ async fn local_trusted_proxy_can_admit_a_full_64_remote_room() {
 #[tokio::test]
 #[ignore = "requires real Caddy sample + backend with trusted loopback and per-IP cap 2"]
 async fn caddy_edge_replaces_spoofed_ip_and_relays_ordered_activation() {
-    let url = std::env::var("PUZZELLA_CADDY_SMOKE_URL").expect("loopback sample URL");
+    let url = std::env::var("JIGSALL_CADDY_SMOKE_URL").expect("loopback sample URL");
     // This fixture deliberately uses HTTP/WS only on local loopback. Production
     // runs the unmodified sample with a public domain and automatic HTTPS.
     assert!(url.starts_with("ws://127.0.0.1:"));
@@ -692,7 +692,7 @@ async fn caddy_edge_replaces_spoofed_ip_and_relays_ordered_activation() {
 }
 
 struct RotatingProvider(std::sync::atomic::AtomicUsize);
-impl puzzella_rendezvous::turn::TurnProvider for RotatingProvider {
+impl jigsall_rendezvous::turn::TurnProvider for RotatingProvider {
     fn issue<'a>(
         &'a self,
         identifier: &'a str,
@@ -700,7 +700,7 @@ impl puzzella_rendezvous::turn::TurnProvider for RotatingProvider {
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<Vec<TurnServer>, puzzella_rendezvous::turn::TurnError>,
+                    Output = Result<Vec<TurnServer>, jigsall_rendezvous::turn::TurnError>,
                 > + Send
                 + 'a,
         >,
@@ -709,7 +709,7 @@ impl puzzella_rendezvous::turn::TurnProvider for RotatingProvider {
             assert_eq!(identifier.len(), 32);
             let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if n == 1 {
-                return Err(puzzella_rendezvous::turn::TurnError::Unavailable);
+                return Err(jigsall_rendezvous::turn::TurnError::Unavailable);
             }
             Ok(vec![TurnServer {
                 address: "turn.cloudflare.com:3478".into(),
@@ -719,8 +719,8 @@ impl puzzella_rendezvous::turn::TurnProvider for RotatingProvider {
         })
     }
 }
-fn turn_config() -> puzzella_rendezvous::turn::TurnConfig {
-    puzzella_rendezvous::turn::TurnConfig {
+fn turn_config() -> jigsall_rendezvous::turn::TurnConfig {
+    jigsall_rendezvous::turn::TurnConfig {
         key_id: "server-key".into(),
         api_token: "server-token".into(),
         ttl: Duration::from_secs(4),
@@ -730,7 +730,7 @@ fn turn_config() -> puzzella_rendezvous::turn::TurnConfig {
 }
 #[tokio::test]
 async fn welcome_precedes_room_creation_and_rotation_retries_without_changing_room() {
-    use puzzella_rendezvous::turn::TurnService;
+    use jigsall_rendezvous::turn::TurnService;
     let p = std::sync::Arc::new(RotatingProvider(std::sync::atomic::AtomicUsize::new(0)));
     let f = Fixture::with_server(
         Server::new(Limits::default()).with_turn(TurnService::new(p.clone(), &turn_config())),
@@ -780,7 +780,7 @@ async fn welcome_precedes_room_creation_and_rotation_retries_without_changing_ro
 }
 #[tokio::test]
 async fn unavailable_provider_still_allows_direct_room_creation() {
-    use puzzella_rendezvous::turn::{TurnError, TurnProvider, TurnService};
+    use jigsall_rendezvous::turn::{TurnError, TurnProvider, TurnService};
     struct Unavailable;
     impl TurnProvider for Unavailable {
         fn issue<'a>(
@@ -819,7 +819,7 @@ async fn unavailable_provider_still_allows_direct_room_creation() {
 
 #[tokio::test]
 async fn hard_budget_notifies_turn_sessions_and_preserves_direct_room_and_signaling() {
-    use puzzella_rendezvous::turn::{
+    use jigsall_rendezvous::turn::{
         budget::{AnalyticsBackend, BillingPeriod, BudgetConfig},
         TurnError, TurnProvider, TurnService,
     };
@@ -978,7 +978,7 @@ async fn hard_budget_notifies_turn_sessions_and_preserves_direct_room_and_signal
 
 #[tokio::test]
 async fn initial_unavailable_session_never_pushes_late_turn() {
-    use puzzella_rendezvous::turn::{TurnError, TurnProvider, TurnService};
+    use jigsall_rendezvous::turn::{TurnError, TurnProvider, TurnService};
     struct Recovering(std::sync::atomic::AtomicUsize);
     impl TurnProvider for Recovering {
         fn issue<'a>(
@@ -1042,7 +1042,7 @@ async fn initial_unavailable_session_never_pushes_late_turn() {
 }
 #[tokio::test]
 async fn concurrent_welcomes_wait_instead_of_becoming_direct_only() {
-    use puzzella_rendezvous::turn::{TurnError, TurnProvider, TurnService};
+    use jigsall_rendezvous::turn::{TurnError, TurnProvider, TurnService};
     struct Slow;
     impl TurnProvider for Slow {
         fn issue<'a>(
@@ -1084,7 +1084,7 @@ async fn concurrent_welcomes_wait_instead_of_becoming_direct_only() {
 }
 #[tokio::test]
 async fn changed_rotation_endpoints_are_not_pushed_or_applied() {
-    use puzzella_rendezvous::turn::{TurnError, TurnProvider, TurnService};
+    use jigsall_rendezvous::turn::{TurnError, TurnProvider, TurnService};
     struct Changing(std::sync::atomic::AtomicUsize);
     impl TurnProvider for Changing {
         fn issue<'a>(
@@ -1142,7 +1142,7 @@ async fn changed_rotation_endpoints_are_not_pushed_or_applied() {
 
 #[tokio::test]
 async fn expired_turn_defaults_report_unavailable_then_recover_without_closing_room() {
-    use puzzella_rendezvous::turn::{TurnError, TurnProvider, TurnService};
+    use jigsall_rendezvous::turn::{TurnError, TurnProvider, TurnService};
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,

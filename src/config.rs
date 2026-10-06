@@ -34,11 +34,11 @@ impl Config {
         let mut limits = Limits::default();
         macro_rules! limit {
             ($name:literal, $field:ident) => {
-                if let Some(value) = read(concat!("PUZZELLA_RENDEZVOUS_", $name))? {
+                if let Some(value) = read(concat!("JIGSALL_RENDEZVOUS_", $name))? {
                     limits.$field = value.parse().map_err(|_| {
                         ConfigError(
                             concat!(
-                                "PUZZELLA_RENDEZVOUS_",
+                                "JIGSALL_RENDEZVOUS_",
                                 $name,
                                 ": expected a positive integer"
                             )
@@ -70,20 +70,20 @@ impl Config {
         limits
             .validate()
             .map_err(|reason| ConfigError(format!("invalid rendezvous limits: {reason}")))?;
-        let listen = read("PUZZELLA_RENDEZVOUS_LISTEN")?
+        let listen = read("JIGSALL_RENDEZVOUS_LISTEN")?
             .unwrap_or_else(|| "127.0.0.1:8080".into())
             .parse()
             .map_err(|_| {
-                ConfigError("PUZZELLA_RENDEZVOUS_LISTEN: expected a numeric socket address".into())
+                ConfigError("JIGSALL_RENDEZVOUS_LISTEN: expected a numeric socket address".into())
             })?;
-        let trusted_proxies = read("PUZZELLA_RENDEZVOUS_TRUSTED_PROXIES")?
+        let trusted_proxies = read("JIGSALL_RENDEZVOUS_TRUSTED_PROXIES")?
             .unwrap_or_default()
             .parse()
             .map_err(|reason| {
-                ConfigError(format!("PUZZELLA_RENDEZVOUS_TRUSTED_PROXIES: {reason}"))
+                ConfigError(format!("JIGSALL_RENDEZVOUS_TRUSTED_PROXIES: {reason}"))
             })?;
-        let key_id = read("PUZZELLA_RENDEZVOUS_TURN_KEY_ID")?.filter(|v| !v.is_empty());
-        let api_token = read("PUZZELLA_RENDEZVOUS_TURN_API_TOKEN")?.filter(|v| !v.is_empty());
+        let key_id = read("JIGSALL_RENDEZVOUS_TURN_KEY_ID")?.filter(|v| !v.is_empty());
+        let api_token = read("JIGSALL_RENDEZVOUS_TURN_API_TOKEN")?.filter(|v| !v.is_empty());
         let mut number = |name, default, min, max| -> Result<u64, ConfigError> {
             let n = read(name)?
                 .map(|v| v.parse::<u64>())
@@ -95,10 +95,10 @@ impl Config {
             }
             Ok(n)
         };
-        let ttl = number("PUZZELLA_RENDEZVOUS_TURN_TTL_SECONDS", 86400, 600, 172800)?;
-        let concurrency = number("PUZZELLA_RENDEZVOUS_TURN_MAX_CONCURRENCY", 4, 1, 32)? as usize;
+        let ttl = number("JIGSALL_RENDEZVOUS_TURN_TTL_SECONDS", 86400, 600, 172800)?;
+        let concurrency = number("JIGSALL_RENDEZVOUS_TURN_MAX_CONCURRENCY", 4, 1, 32)? as usize;
         let requests_per_minute =
-            number("PUZZELLA_RENDEZVOUS_TURN_REQUESTS_PER_MINUTE", 120, 1, 4096)? as u32;
+            number("JIGSALL_RENDEZVOUS_TURN_REQUESTS_PER_MINUTE", 120, 1, 4096)? as u32;
         let turn = match (key_id, api_token) {
             (None, None) => None,
             (Some(key_id), Some(api_token))
@@ -123,7 +123,7 @@ impl Config {
                 ))
             }
         };
-        let enabled = read("PUZZELLA_RENDEZVOUS_TURN_BUDGET_ENABLED")?;
+        let enabled = read("JIGSALL_RENDEZVOUS_TURN_BUDGET_ENABLED")?;
         let enabled_configured = enabled.is_some();
         let enabled = match enabled.as_deref() {
             None | Some("false") | Some("0") => false,
@@ -149,7 +149,7 @@ impl Config {
         ];
         let mut budget_values = std::collections::BTreeMap::new();
         for name in required_names.into_iter().chain(optional_names) {
-            if let Some(value) = read(&format!("PUZZELLA_RENDEZVOUS_{name}"))? {
+            if let Some(value) = read(&format!("JIGSALL_RENDEZVOUS_{name}"))? {
                 budget_values.insert(name, value);
             }
         }
@@ -273,22 +273,19 @@ mod tests {
         assert_eq!(c.limits.outbound_bytes_per_connection, 256 * 1024);
         assert_eq!(c.limits.outbound_bytes_global, 32 * 1024 * 1024);
         let c = config(&[
-            ("PUZZELLA_RENDEZVOUS_LISTEN", "[::1]:9000"),
+            ("JIGSALL_RENDEZVOUS_LISTEN", "[::1]:9000"),
+            ("JIGSALL_RENDEZVOUS_TRUSTED_PROXIES", "127.0.0.1/32,::1/128"),
+            ("JIGSALL_RENDEZVOUS_MAX_CONNECTIONS", "1024"),
+            ("JIGSALL_RENDEZVOUS_MAX_CONNECTIONS_PER_IP", "1024"),
             (
-                "PUZZELLA_RENDEZVOUS_TRUSTED_PROXIES",
-                "127.0.0.1/32,::1/128",
-            ),
-            ("PUZZELLA_RENDEZVOUS_MAX_CONNECTIONS", "1024"),
-            ("PUZZELLA_RENDEZVOUS_MAX_CONNECTIONS_PER_IP", "1024"),
-            (
-                "PUZZELLA_RENDEZVOUS_MAX_ADMISSIONS_PER_IP_PER_MINUTE",
+                "JIGSALL_RENDEZVOUS_MAX_ADMISSIONS_PER_IP_PER_MINUTE",
                 "2048",
             ),
             (
-                "PUZZELLA_RENDEZVOUS_MAX_ROOM_ATTEMPTS_PER_IP_PER_MINUTE",
+                "JIGSALL_RENDEZVOUS_MAX_ROOM_ATTEMPTS_PER_IP_PER_MINUTE",
                 "4096",
             ),
-            ("PUZZELLA_RENDEZVOUS_MAX_OUTBOUND_BYTES_GLOBAL", "67108864"),
+            ("JIGSALL_RENDEZVOUS_MAX_OUTBOUND_BYTES_GLOBAL", "67108864"),
         ])
         .unwrap();
         assert_eq!(c.limits.connections_per_ip, 1024);
@@ -300,18 +297,18 @@ mod tests {
     fn turn_configuration_is_optional_bounded_and_secret_safe() {
         assert!(config(&[]).unwrap().turn.is_none());
         let values = [
-            ("PUZZELLA_RENDEZVOUS_TURN_KEY_ID", "private-key"),
-            ("PUZZELLA_RENDEZVOUS_TURN_API_TOKEN", "private-token"),
+            ("JIGSALL_RENDEZVOUS_TURN_KEY_ID", "private-key"),
+            ("JIGSALL_RENDEZVOUS_TURN_API_TOKEN", "private-token"),
         ];
         let valid = config(&values).unwrap();
         assert_eq!(valid.turn.as_ref().unwrap().ttl.as_secs(), 86400);
         assert!(!format!("{valid:?}").contains("private-"));
         assert!(config(&values[..1]).is_err());
         for (key, value) in [
-            ("PUZZELLA_RENDEZVOUS_TURN_TTL_SECONDS", "599"),
-            ("PUZZELLA_RENDEZVOUS_TURN_TTL_SECONDS", "172801"),
-            ("PUZZELLA_RENDEZVOUS_TURN_MAX_CONCURRENCY", "33"),
-            ("PUZZELLA_RENDEZVOUS_TURN_REQUESTS_PER_MINUTE", "0"),
+            ("JIGSALL_RENDEZVOUS_TURN_TTL_SECONDS", "599"),
+            ("JIGSALL_RENDEZVOUS_TURN_TTL_SECONDS", "172801"),
+            ("JIGSALL_RENDEZVOUS_TURN_MAX_CONCURRENCY", "33"),
+            ("JIGSALL_RENDEZVOUS_TURN_REQUESTS_PER_MINUTE", "0"),
         ] {
             let mut bad = values.to_vec();
             bad.push((key, value));
@@ -321,25 +318,25 @@ mod tests {
     #[test]
     fn budget_configuration_requires_complete_consistent_settings_and_redacts_tokens() {
         let mut values = vec![
-            ("PUZZELLA_RENDEZVOUS_TURN_KEY_ID", "key"),
-            ("PUZZELLA_RENDEZVOUS_TURN_API_TOKEN", "private-turn-token"),
-            ("PUZZELLA_RENDEZVOUS_TURN_BUDGET_ENABLED", "true"),
+            ("JIGSALL_RENDEZVOUS_TURN_KEY_ID", "key"),
+            ("JIGSALL_RENDEZVOUS_TURN_API_TOKEN", "private-turn-token"),
+            ("JIGSALL_RENDEZVOUS_TURN_BUDGET_ENABLED", "true"),
             (
-                "PUZZELLA_RENDEZVOUS_TURN_BUDGET_ACCOUNT_ID",
+                "JIGSALL_RENDEZVOUS_TURN_BUDGET_ACCOUNT_ID",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ),
             (
-                "PUZZELLA_RENDEZVOUS_TURN_BUDGET_ANALYTICS_TOKEN",
+                "JIGSALL_RENDEZVOUS_TURN_BUDGET_ANALYTICS_TOKEN",
                 "private-analytics-token",
             ),
-            ("PUZZELLA_RENDEZVOUS_TURN_BUDGET_SOFT_LIMIT_BYTES", "100"),
-            ("PUZZELLA_RENDEZVOUS_TURN_BUDGET_HARD_LIMIT_BYTES", "200"),
+            ("JIGSALL_RENDEZVOUS_TURN_BUDGET_SOFT_LIMIT_BYTES", "100"),
+            ("JIGSALL_RENDEZVOUS_TURN_BUDGET_HARD_LIMIT_BYTES", "200"),
             (
-                "PUZZELLA_RENDEZVOUS_TURN_BUDGET_BILLING_ANCHOR",
+                "JIGSALL_RENDEZVOUS_TURN_BUDGET_BILLING_ANCHOR",
                 "2026-01-17T12:00:00+09:00",
             ),
             (
-                "PUZZELLA_RENDEZVOUS_TURN_BUDGET_REGISTRY_PATH",
+                "JIGSALL_RENDEZVOUS_TURN_BUDGET_REGISTRY_PATH",
                 "registry.jsonl",
             ),
         ];
@@ -355,21 +352,21 @@ mod tests {
             assert!(config(&missing).is_err());
         }
         for (key, invalid) in [
-            ("PUZZELLA_RENDEZVOUS_TURN_BUDGET_ENABLED", "yes"),
-            ("PUZZELLA_RENDEZVOUS_TURN_BUDGET_ACCOUNT_ID", "invalid"),
+            ("JIGSALL_RENDEZVOUS_TURN_BUDGET_ENABLED", "yes"),
+            ("JIGSALL_RENDEZVOUS_TURN_BUDGET_ACCOUNT_ID", "invalid"),
             (
-                "PUZZELLA_RENDEZVOUS_TURN_BUDGET_ANALYTICS_TOKEN",
+                "JIGSALL_RENDEZVOUS_TURN_BUDGET_ANALYTICS_TOKEN",
                 "invalid token",
             ),
-            ("PUZZELLA_RENDEZVOUS_TURN_BUDGET_SOFT_LIMIT_BYTES", "200"),
-            ("PUZZELLA_RENDEZVOUS_TURN_BUDGET_HARD_LIMIT_BYTES", "0"),
-            ("PUZZELLA_RENDEZVOUS_TURN_BUDGET_POLL_SECONDS", "0"),
-            ("PUZZELLA_RENDEZVOUS_TURN_BUDGET_STALE_SECONDS", "30"),
+            ("JIGSALL_RENDEZVOUS_TURN_BUDGET_SOFT_LIMIT_BYTES", "200"),
+            ("JIGSALL_RENDEZVOUS_TURN_BUDGET_HARD_LIMIT_BYTES", "0"),
+            ("JIGSALL_RENDEZVOUS_TURN_BUDGET_POLL_SECONDS", "0"),
+            ("JIGSALL_RENDEZVOUS_TURN_BUDGET_STALE_SECONDS", "30"),
             (
-                "PUZZELLA_RENDEZVOUS_TURN_BUDGET_BILLING_ANCHOR",
+                "JIGSALL_RENDEZVOUS_TURN_BUDGET_BILLING_ANCHOR",
                 "2026-01-01",
             ),
-            ("PUZZELLA_RENDEZVOUS_TURN_BUDGET_PERIOD_SECONDS", "0"),
+            ("JIGSALL_RENDEZVOUS_TURN_BUDGET_PERIOD_SECONDS", "0"),
         ] {
             let mut bad = values.clone();
             bad.retain(|(k, _)| *k != key);
@@ -383,20 +380,17 @@ mod tests {
     #[test]
     fn invalid_configuration_fails_before_binding() {
         for values in [
-            vec![("PUZZELLA_RENDEZVOUS_MAX_CONNECTIONS", "0")],
-            vec![("PUZZELLA_RENDEZVOUS_MAX_CONNECTIONS", "1025")],
-            vec![("PUZZELLA_RENDEZVOUS_MAX_CONNECTIONS_PER_IP", "1025")],
+            vec![("JIGSALL_RENDEZVOUS_MAX_CONNECTIONS", "0")],
+            vec![("JIGSALL_RENDEZVOUS_MAX_CONNECTIONS", "1025")],
+            vec![("JIGSALL_RENDEZVOUS_MAX_CONNECTIONS_PER_IP", "1025")],
             vec![(
-                "PUZZELLA_RENDEZVOUS_MAX_ADMISSIONS_PER_IP_PER_MINUTE",
+                "JIGSALL_RENDEZVOUS_MAX_ADMISSIONS_PER_IP_PER_MINUTE",
                 "65537",
             )],
-            vec![("PUZZELLA_RENDEZVOUS_MAX_OUTBOUND_BYTES_GLOBAL", "67108865")],
-            vec![(
-                "PUZZELLA_RENDEZVOUS_MAX_OUTBOUND_BYTES_PER_CONNECTION",
-                "-1",
-            )],
-            vec![("PUZZELLA_RENDEZVOUS_LISTEN", "localhost:8080")],
-            vec![("PUZZELLA_RENDEZVOUS_TRUSTED_PROXIES", "0.0.0.0/0")],
+            vec![("JIGSALL_RENDEZVOUS_MAX_OUTBOUND_BYTES_GLOBAL", "67108865")],
+            vec![("JIGSALL_RENDEZVOUS_MAX_OUTBOUND_BYTES_PER_CONNECTION", "-1")],
+            vec![("JIGSALL_RENDEZVOUS_LISTEN", "localhost:8080")],
+            vec![("JIGSALL_RENDEZVOUS_TRUSTED_PROXIES", "0.0.0.0/0")],
         ] {
             assert!(config(&values).is_err(), "{values:?}");
         }

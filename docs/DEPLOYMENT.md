@@ -8,8 +8,8 @@ your domain's DNS at the host and permit HTTPS/certificate issuance traffic to
 Caddy. Set the backend environment before starting it:
 
 ```sh
-export PUZZELLA_RENDEZVOUS_LISTEN=127.0.0.1:8080
-export PUZZELLA_RENDEZVOUS_TRUSTED_PROXIES=127.0.0.1/32
+export JIGSALL_RENDEZVOUS_LISTEN=127.0.0.1:8080
+export JIGSALL_RENDEZVOUS_TRUSTED_PROXIES=127.0.0.1/32
 cargo run --locked --release
 ```
 
@@ -55,7 +55,7 @@ reservations/connections and their state, not every pre-upgrade TCP socket.
 Build from the repository root:
 
 ```sh
-docker build --pull -t puzzella-rendezvous:local .
+docker build --pull -t jigsall-rendezvous:local .
 ```
 
 The image contains the release binary and Debian runtime libraries, runs as
@@ -73,12 +73,12 @@ existing [deploy/Caddyfile](../deploy/Caddyfile) upstream and lets the backend
 trust exactly the local Caddy connection:
 
 ```sh
-docker run -d --name puzzella-rendezvous --restart unless-stopped \
+docker run -d --name jigsall-rendezvous --restart unless-stopped \
   --network host --read-only --cap-drop ALL \
   --security-opt no-new-privileges=true --stop-timeout 10 \
-  --env PUZZELLA_RENDEZVOUS_LISTEN=127.0.0.1:8080 \
-  --env PUZZELLA_RENDEZVOUS_TRUSTED_PROXIES=127.0.0.1/32 \
-  puzzella-rendezvous:local
+  --env JIGSALL_RENDEZVOUS_LISTEN=127.0.0.1:8080 \
+  --env JIGSALL_RENDEZVOUS_TRUSTED_PROXIES=127.0.0.1/32 \
+  jigsall-rendezvous:local
 curl --fail http://127.0.0.1:8080/healthz
 ```
 
@@ -94,14 +94,14 @@ unused subnet for your deployment:
 ```sh
 docker network create --subnet 172.30.0.0/24 rendezvous-backend
 docker network connect --ip 172.30.0.2 rendezvous-backend caddy
-docker run -d --name puzzella-rendezvous --restart unless-stopped \
+docker run -d --name jigsall-rendezvous --restart unless-stopped \
   --network rendezvous-backend --read-only --cap-drop ALL \
   --security-opt no-new-privileges=true --stop-timeout 10 \
-  --env PUZZELLA_RENDEZVOUS_TRUSTED_PROXIES=172.30.0.2/32 \
-  puzzella-rendezvous:local
+  --env JIGSALL_RENDEZVOUS_TRUSTED_PROXIES=172.30.0.2/32 \
+  jigsall-rendezvous:local
 ```
 
-In the existing Caddy configuration, use `reverse_proxy puzzella-rendezvous:8080`
+In the existing Caddy configuration, use `reverse_proxy jigsall-rendezvous:8080`
 instead of `reverse_proxy 127.0.0.1:8080`, retaining the sample's route/header
 policy and transport deadlines. Preserve the backend-network attachment and
 static Caddy IP in your container manager when recreating it. Publish only
@@ -110,13 +110,13 @@ IP, rather than the entire Docker/private address range. The native
 `deploy/rendezvous.env.example` sets a loopback listener/proxy and therefore
 needs those values changed before use with this bridge-network example.
 
-Use `docker logs puzzella-rendezvous` for server logs.
-`docker stop --time 10 puzzella-rendezvous` delivers SIGTERM directly to the
+Use `docker logs jigsall-rendezvous` for server logs.
+`docker stop --time 10 jigsall-rendezvous` delivers SIGTERM directly to the
 server's PID 1 and allows its bounded shutdown drain to finish.
 
 ## Source-IP trust policy
 
-`PUZZELLA_RENDEZVOUS_TRUSTED_PROXIES` defaults to empty (trust no proxy). Configure
+`JIGSALL_RENDEZVOUS_TRUSTED_PROXIES` defaults to empty (trust no proxy). Configure
 at most 32 comma-separated canonical IPv4/IPv6 CIDRs with explicit prefixes.
 `0.0.0.0/0`, `::/0`, noncanonical networks and IPv4-mapped IPv6 CIDRs are rejected.
 Use IPv4 CIDRs for IPv4 clients; mapped IPv4 socket/header addresses are normalized
@@ -148,7 +148,7 @@ guards at the edge**. Raising only the connection cap leaves the default
 
 ## Validated runtime limits
 
-All names below have the prefix `PUZZELLA_RENDEZVOUS_`. Values are positive integer
+All names below have the prefix `JIGSALL_RENDEZVOUS_`. Values are positive integer
 counts or bytes, not `KiB`/`MiB` strings. Invalid, zero, overflowing and above-ceiling
 values fail startup **before binding the listener**. The lower of local and global
 caps always applies; IP caps may exceed a smaller global connection cap.
@@ -203,7 +203,7 @@ through one trusted loopback proxy address. Shared v1 golden fixtures validate t
 
 The optional real-Caddy test is
 `caddy_edge_replaces_spoofed_ip_and_relays_ordered_activation`. Start the backend
-with trusted loopback and `PUZZELLA_RENDEZVOUS_MAX_CONNECTIONS_PER_IP=2`. For this
+with trusted loopback and `JIGSALL_RENDEZVOUS_MAX_CONNECTIONS_PER_IP=2`. For this
 local test only, copy the sample to an ignored file under `target/`, replace its
 site address with `http://127.0.0.1:18081`, and add `bind 127.0.0.1` in the site.
 Disable the admin endpoint/config persistence in that copy and place test
@@ -211,7 +211,7 @@ Disable the admin endpoint/config persistence in that copy and place test
 unchanged. Then run:
 
 ```sh
-PUZZELLA_CADDY_SMOKE_URL=ws://127.0.0.1:18081/v1/ws \
+JIGSALL_CADDY_SMOKE_URL=ws://127.0.0.1:18081/v1/ws \
   cargo test --locked caddy_edge_replaces_spoofed_ip_and_relays_ordered_activation -- --ignored --nocapture
 ```
 
@@ -229,7 +229,7 @@ public certificate deployment or Internet NAT traversal result.
 
 ## TURN usage budget
 
-The budget is disabled by default. With `PUZZELLA_RENDEZVOUS_TURN_BUDGET_ENABLED=true`,
+The budget is disabled by default. With `JIGSALL_RENDEZVOUS_TURN_BUDGET_ENABLED=true`,
 configure all required settings below in addition to the existing TURN key/token.
 The Analytics token is independent of the credential-generation/revoke token.
 Give it **Account / Account Analytics / Read**, scoped to the configured account,
@@ -237,7 +237,7 @@ as required by [Cloudflare TURN Analytics](https://developers.cloudflare.com/rea
 Keep both tokens on the server. Credential revocation uses the TURN key API token
 and the documented [revoke endpoint](https://developers.cloudflare.com/realtime/turn/generate-credentials/#revoke-credentials).
 
-All suffixes below have the prefix `PUZZELLA_RENDEZVOUS_`:
+All suffixes below have the prefix `JIGSALL_RENDEZVOUS_`:
 
 | Suffix | Default / requirement |
 | --- | --- |
@@ -250,7 +250,7 @@ All suffixes below have the prefix `PUZZELLA_RENDEZVOUS_`:
 | `TURN_BUDGET_STALE_SECONDS` | 300; range 1–86400, greater than polling interval |
 | `TURN_BUDGET_BILLING_ANCHOR` | Required: RFC3339 timestamp with whole seconds |
 | `TURN_BUDGET_PERIOD_SECONDS` | Unset: calendar months; optional fixed cycle length 60–31622400 seconds |
-| `TURN_BUDGET_REGISTRY_PATH` | Required: writable durable file, e.g. `/var/lib/puzzella-turn/registry.jsonl` |
+| `TURN_BUDGET_REGISTRY_PATH` | Required: writable durable file, e.g. `/var/lib/jigsall-turn/registry.jsonl` |
 
 Missing/invalid settings reject startup before the listener binds. Budget settings
 without an enable flag also reject startup; explicit `false` ignores retained
@@ -320,8 +320,8 @@ a billing-period reset. No credential username, password or token is logged.
 
 For Docker, mount a writable persistent directory at the registry path and make
 it owned by UID/GID 10001; the rest of the filesystem may remain read-only. Add
-`--mount type=bind,src=/srv/puzzella-turn,dst=/var/lib/puzzella-turn` and set the
-registry path to `/var/lib/puzzella-turn/registry.jsonl` in the environment file.
+`--mount type=bind,src=/srv/jigsall-turn,dst=/var/lib/jigsall-turn` and set the
+registry path to `/var/lib/jigsall-turn/registry.jsonl` in the environment file.
 Back up this directory along with its configuration. A process crash/network
 timeout after Cloudflare minted a credential but before its response was received
 cannot reveal that unknown username locally; no such credential is sent to the
@@ -345,12 +345,12 @@ Create a TURN key and API token using Cloudflare's
 Keep both in the Rendezvous service's environment/secret store:
 
 ```sh
-export PUZZELLA_RENDEZVOUS_TURN_KEY_ID=your-turn-key-id
-export PUZZELLA_RENDEZVOUS_TURN_API_TOKEN=your-server-only-api-token
-export PUZZELLA_RENDEZVOUS_TURN_TTL_SECONDS=86400
+export JIGSALL_RENDEZVOUS_TURN_KEY_ID=your-turn-key-id
+export JIGSALL_RENDEZVOUS_TURN_API_TOKEN=your-server-only-api-token
+export JIGSALL_RENDEZVOUS_TURN_TTL_SECONDS=86400
 ```
 
-Never put these secrets in Puzzella's environment, `internet-defaults.env`,
+Never put these secrets in Jigsall's environment, `internet-defaults.env`,
 source, release binaries or WSS protocol. WSS distributes only short-lived
 username/password pairs and UDP server addresses. SPAKE2 remains the gameplay
 password authentication; TURN issuance confers no player identity or membership.
@@ -359,9 +359,9 @@ certificates for that outbound connection; Caddy still terminates inbound WSS.
 
 | Setting | Default | Accepted range |
 | --- | --- | --- |
-| `PUZZELLA_RENDEZVOUS_TURN_TTL_SECONDS` | 86400 (24 hours) | 600–172800 seconds |
-| `PUZZELLA_RENDEZVOUS_TURN_MAX_CONCURRENCY` | 4 | 1–32 |
-| `PUZZELLA_RENDEZVOUS_TURN_REQUESTS_PER_MINUTE` | 120 | 1–4096 |
+| `JIGSALL_RENDEZVOUS_TURN_TTL_SECONDS` | 86400 (24 hours) | 600–172800 seconds |
+| `JIGSALL_RENDEZVOUS_TURN_MAX_CONCURRENCY` | 4 | 1–32 |
+| `JIGSALL_RENDEZVOUS_TURN_REQUESTS_PER_MINUTE` | 120 | 1–4096 |
 
 Set both key variables or neither. Invalid/partial settings fail before binding,
 with secret-free diagnostics. TURN disabled or provider/network/rate-limit failure
@@ -400,7 +400,7 @@ peer does not attempt an allocation with expired credentials. Existing routes
 retain their original configuration. The initial endpoint set stays fixed, and
 recovery re-enables future TURN when a fresh credential with that set arrives.
 Budget-aware clients must honor `turn_unavailable` even before the latest default
-expires: a hard budget can revoke it early. Older Puzzella clients that ignore
+expires: a hard budget can revoke it early. Older Jigsall clients that ignore
 early unavailability retain unusable cached TURN defaults until expiry; update
 those clients before enabling the hard budget. The event never requests a
 gameplay disconnect or removal of Direct ICE/STUN configuration.
@@ -440,7 +440,7 @@ transient update failure, successful rotation, provider recovery, fixed initial
 availability, endpoint-set rejection, queued concurrent welcomes, and expired
 defaults becoming unavailable followed by provider recovery without room closure. The
 server's `turn_fixture_server` example also passed six local cross-repository
-smoke runs using Puzzella's `run_turn_smoke.py`, including fixed allocation
+smoke runs using Jigsall's `run_turn_smoke.py`, including fixed allocation
 credentials during pushed-default updates, forced-relay Sync/Ready
 and encrypted traffic after control shutdown, plus initially unavailable sessions
 remaining direct-only after mock API recovery. This uses loopback WS and a local
