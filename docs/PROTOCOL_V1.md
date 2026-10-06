@@ -224,7 +224,7 @@ Welcome optionally contains `turn`; omission means TURN unavailable/disabled and
 permits direct ICE. The initial value is available before CreateRoom/JoinRoom and
 before any GNS peer connection. Only sessions with TURN in Welcome subsequently
 receive `turn_credentials` for future connection defaults and possibly
-`turn_unavailable` after expiry. Existing ICE connections retain their initial
+`turn_unavailable` after expiry or early revocation by a hard TURN budget. Existing ICE connections retain their initial
 username/password for the lifetime of their allocations; a pushed value does not
 extend those credentials' expiry. An omitted initial value fixes this entire WSS
 session to direct-only; later credentials are not issued or installed.
@@ -233,12 +233,16 @@ changed sets are rejected before listener defaults are mutated. Existing
 connection configuration is never replaced. These messages do not change room
 membership, SPAKE2 authentication or gameplay lifetime. Client-to-server TURN
 commands are rejected. Old/expired updates are ignored. On `turn_unavailable`,
-the client checks that its latest default has expired before clearing TURN
+budget-aware clients must clear TURN defaults even when the latest credential
+has not expired: it can have been revoked. Clear TURN
 server/user/password defaults and disabling the Relay bit for future incoming
 and outgoing connections. Existing ICE connections keep their original values.
 The initial endpoint set and expiry watermark remain intact: a fresh credential
-with the same set re-enables TURN for future peers. An early/stale unavailable
-event cannot clear a newer, still-valid default. These events do not close gameplay.
+with the same set re-enables TURN for future peers. WSS publication orders budget
+transitions with credential updates, so credentials are never enqueued after a
+HardLimited transition while that state is active. Older clients that only honor
+unavailability after expiry need updating to disable cached defaults immediately.
+These events do not close gameplay.
 
 ```json
 {"v":1,"type":"turn_credentials","turn":{"expires_at_unix":2000086400,"servers":[{"address":"turn.cloudflare.com:3478","username":"short-lived-user","password":"short-lived-password"}]}}

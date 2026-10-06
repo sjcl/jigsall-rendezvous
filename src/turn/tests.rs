@@ -179,6 +179,43 @@ async fn http_provider_posts_only_ttl_and_random_identifier_and_sanitizes_failur
     );
     task.abort();
 }
+
+#[tokio::test]
+async fn http_revoke_uses_encoded_username_path_turn_token_and_no_secrets_in_errors() {
+    use axum::{extract::Path, routing::post};
+    let app = axum::Router::new().route(
+        "/keys/key/credentials/{username}/revoke",
+        post(
+            |Path(username): Path<String>,
+             headers: axum::http::HeaderMap,
+             body: axum::body::Bytes| async move {
+                assert_eq!(headers["authorization"], "Bearer fixture-turn-token");
+                assert!(body.is_empty());
+                if username == "user/with?reserved#chars" {
+                    axum::http::StatusCode::NO_CONTENT
+                } else {
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let provider = CloudflareTurnProvider {
+        client: reqwest::Client::new(),
+        endpoint: format!("http://{address}/keys/key/credentials/generate-ice-servers"),
+        token: "fixture-turn-token".into(),
+    };
+    assert_eq!(provider.revoke("user/with?reserved#chars").await, Ok(()));
+    assert_eq!(
+        provider.revoke("failure").await,
+        Err(TurnError::Unavailable)
+    );
+    task.abort();
+}
 #[tokio::test]
 #[ignore = "manual: requires explicitly configured Cloudflare TURN secrets"]
 async fn cloudflare_manual_credential_issue() {

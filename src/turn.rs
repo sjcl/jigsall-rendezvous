@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Semaphore;
+pub mod budget;
 
 #[derive(Clone)]
 pub struct TurnConfig {
@@ -43,6 +44,12 @@ pub trait TurnProvider: Send + Sync {
         identifier: &'a str,
         ttl: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<TurnServer>, TurnError>> + Send + 'a>>;
+    fn revoke<'a>(
+        &'a self,
+        _username: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TurnError>> + Send + 'a>> {
+        Box::pin(async { Err(TurnError::Unavailable) })
+    }
 }
 pub struct CloudflareTurnProvider {
     client: reqwest::Client,
@@ -66,6 +73,34 @@ impl CloudflareTurnProvider {
     }
 }
 impl TurnProvider for CloudflareTurnProvider {
+    fn revoke<'a>(
+        &'a self,
+        username: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TurnError>> + Send + 'a>> {
+        Box::pin(async move {
+            let base = self
+                .endpoint
+                .strip_suffix("/generate-ice-servers")
+                .ok_or(TurnError::Unavailable)?;
+            let mut url = reqwest::Url::parse(base).map_err(|_| TurnError::Unavailable)?;
+            url.path_segments_mut()
+                .map_err(|_| TurnError::Unavailable)?
+                .push(username)
+                .push("revoke");
+            let response = self
+                .client
+                .post(url)
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .map_err(|_| TurnError::Unavailable)?;
+            if response.status() == reqwest::StatusCode::NO_CONTENT {
+                Ok(())
+            } else {
+                Err(TurnError::Unavailable)
+            }
+        })
+    }
     fn issue<'a>(
         &'a self,
         identifier: &'a str,
@@ -142,6 +177,8 @@ pub struct TurnService {
     ttl: Duration,
     permits: Arc<Semaphore>,
     rate: Arc<Mutex<Window>>,
+    budget: Option<Arc<budget::BudgetGuard>>,
+    _monitor: Option<Arc<budget::MonitorTasks>>,
 }
 impl TurnService {
     pub fn new(provider: Arc<dyn TurnProvider>, config: &TurnConfig) -> Self {
@@ -154,6 +191,33 @@ impl TurnService {
                 Duration::from_secs(60),
                 Instant::now(),
             ))),
+            budget: None,
+            _monitor: None,
+        }
+    }
+    pub async fn with_budget(
+        mut self,
+        config: budget::BudgetConfig,
+        key: String,
+        backend: Arc<dyn budget::AnalyticsBackend>,
+    ) -> std::io::Result<Self> {
+        let (guard, monitor) = budget::start(config, key, backend, self.provider.clone()).await?;
+        self.budget = Some(guard);
+        self._monitor = Some(monitor);
+        Ok(self)
+    }
+    pub fn budget(&self) -> Option<Arc<budget::BudgetGuard>> {
+        self.budget.clone()
+    }
+    pub(crate) async fn publish<T>(
+        &self,
+        turn: TurnCredentials,
+        publish: impl FnOnce(Option<TurnCredentials>) -> T,
+    ) -> T {
+        if let Some(budget) = &self.budget {
+            budget.publish(turn, publish).await
+        } else {
+            publish(Some(turn))
         }
     }
     pub(crate) async fn issue(&self, identifier: &str) -> Result<TurnCredentials, TurnError> {
@@ -163,17 +227,57 @@ impl TurnService {
             .map_err(|_| TurnError::Unavailable)?
     }
     async fn issue_admitted(&self, identifier: &str) -> Result<TurnCredentials, TurnError> {
+        if self.budget.as_ref().is_some_and(|b| !b.can_issue()) {
+            return Err(TurnError::Unavailable);
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         let _permit = self
             .permits
-            .acquire()
+            .clone()
+            .acquire_owned()
             .await
             .map_err(|_| TurnError::Unavailable)?;
+        if self.budget.as_ref().is_some_and(|b| !b.can_issue()) {
+            return Err(TurnError::Unavailable);
+        }
         if !self.rate.lock().unwrap().take(Instant::now()) {
             return Err(TurnError::Limited);
         }
         // Start the TTL clock before HTTP I/O so latency cannot extend validity locally.
         let issued = unix_now();
-        let servers = self.provider.issue(identifier, self.ttl).await?;
+        let servers = if let Some(budget) = &self.budget {
+            // Once HTTP starts, a bounded task owns the permit and commits any
+            // successful response even if a socket/outer deadline cancels its wait.
+            let provider = self.provider.clone();
+            let budget = budget.clone();
+            let identifier = identifier.to_owned();
+            let ttl = self.ttl;
+            return tokio::spawn(async move {
+                let _permit = _permit;
+                if !budget.can_issue() {
+                    return Err(TurnError::Unavailable);
+                }
+                let servers = tokio::time::timeout_at(deadline, provider.issue(&identifier, ttl))
+                    .await
+                    .map_err(|_| TurnError::Unavailable)??;
+                let turn = TurnCredentials {
+                    expires_at_unix: issued + ttl.as_secs(),
+                    servers,
+                };
+                turn.validate().map_err(|_| TurnError::InvalidResponse)?;
+                // Registry expiry conservatively covers provider processing latency.
+                let registered = budget.register(&turn, unix_now() + ttl.as_secs() + 1).await;
+                if !registered || turn.expires_at_unix <= unix_now() {
+                    budget.discard(&turn).await;
+                    return Err(TurnError::Unavailable);
+                }
+                Ok(turn)
+            })
+            .await
+            .map_err(|_| TurnError::Unavailable)?;
+        } else {
+            self.provider.issue(identifier, self.ttl).await?
+        };
         let turn = TurnCredentials {
             expires_at_unix: issued + self.ttl.as_secs(),
             servers,
@@ -195,8 +299,30 @@ impl TurnService {
         let mut delay = self.ttl / 2;
         let mut backoff = Duration::from_secs(1);
         let mut expiry_reported = false;
+        let mut changes = self.budget.as_ref().map(|b| b.subscribe());
+        let mut hard_generation = changes.as_ref().map_or(0, |c| c.borrow().hard_generation);
+        if self
+            .budget
+            .as_ref()
+            .is_some_and(|b| b.status().state == budget::BudgetState::HardLimited)
+        {
+            delay = Duration::ZERO;
+        }
         loop {
-            tokio::time::sleep(delay).await;
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {},
+                _ = async { match &mut changes { Some(c) => { let _ = c.changed().await; }, None => std::future::pending().await } } => {}
+            }
+            let hard = self.budget.as_ref().is_some_and(|b| {
+                let status = b.status();
+                let hard = status.state == budget::BudgetState::HardLimited
+                    || status.hard_generation != hard_generation;
+                hard_generation = status.hard_generation;
+                hard
+            });
+            if hard && !expiry_reported {
+                expiry_reported = tx.try_send(ServerMessage::TurnUnavailable {}).is_ok();
+            }
             let update = self.issue(&identifier).await.and_then(|turn| {
                 if current.same_server_set(&turn) {
                     Ok(turn)
@@ -208,16 +334,28 @@ impl TurnService {
                 Ok(turn) => {
                     // Keep one newly issued value while a bounded outbound queue is full.
                     // Do not mint another credential or close a room because of TURN pressure.
-                    while tx
-                        .try_send(ServerMessage::TurnCredentials { turn: turn.clone() })
-                        .is_err()
-                    {
+                    let mut published = false;
+                    while !published {
+                        let result = self
+                            .publish(turn.clone(), |value| {
+                                value.map(|turn| {
+                                    tx.try_send(ServerMessage::TurnCredentials { turn }).is_ok()
+                                })
+                            })
+                            .await;
+                        let Some(sent) = result else {
+                            break;
+                        };
+                        published = sent;
+                        if published {
+                            break;
+                        }
                         if unix_now() >= turn.expires_at_unix {
                             break;
                         }
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
-                    if unix_now() < turn.expires_at_unix {
+                    if published && unix_now() < turn.expires_at_unix {
                         current = turn;
                         expiry_reported = false;
                         backoff = Duration::from_secs(1);
@@ -247,7 +385,8 @@ fn unix_now() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-/// Aborting the session-owned task cancels HTTP I/O and releases its permit.
+/// Aborting rotation cancels its wait. With budgets, already-started issuance
+/// finishes registry bookkeeping in its permit-owning task.
 pub(crate) struct Rotation(pub tokio::task::JoinHandle<()>);
 impl Drop for Rotation {
     fn drop(&mut self) {

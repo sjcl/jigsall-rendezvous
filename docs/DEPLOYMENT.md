@@ -61,8 +61,9 @@ docker build --pull -t puzzella-rendezvous:local .
 The image contains the release binary and Debian runtime libraries, runs as
 UID/GID 10001, and supports a read-only filesystem. It serves plain HTTP/WS on
 `0.0.0.0:8080` by default. Caddy handles TLS separately; no Caddy binary or
-certificates are included. No persistent volume is needed: restarting the
-container clears all rooms, as with a native process. Runtime settings below
+certificates are included. A persistent volume is needed only when the optional
+TURN usage budget is enabled. Restarting the container clears all rooms, as with
+a native process. Runtime settings below
 remain available through `--env` or `--env-file`.
 
 ### Caddy on the Linux host
@@ -226,6 +227,117 @@ sample adaptation/provision validation and the separate real-Caddy loopback
 test. This verifies the configuration and proxy behavior; it does not claim a
 public certificate deployment or Internet NAT traversal result.
 
+## TURN usage budget
+
+The budget is disabled by default. With `PUZZELLA_RENDEZVOUS_TURN_BUDGET_ENABLED=true`,
+configure all required settings below in addition to the existing TURN key/token.
+The Analytics token is independent of the credential-generation/revoke token.
+Give it **Account / Account Analytics / Read**, scoped to the configured account,
+as required by [Cloudflare TURN Analytics](https://developers.cloudflare.com/realtime/turn/analytics/).
+Keep both tokens on the server. Credential revocation uses the TURN key API token
+and the documented [revoke endpoint](https://developers.cloudflare.com/realtime/turn/generate-credentials/#revoke-credentials).
+
+All suffixes below have the prefix `PUZZELLA_RENDEZVOUS_`:
+
+| Suffix | Default / requirement |
+| --- | --- |
+| `TURN_BUDGET_ENABLED` | `false`; accepts `true`/`false` or `1`/`0` |
+| `TURN_BUDGET_ACCOUNT_ID` | Required: 32 hexadecimal characters |
+| `TURN_BUDGET_ANALYTICS_TOKEN` | Required: account-scoped Analytics read token |
+| `TURN_BUDGET_SOFT_LIMIT_BYTES` | Required: positive integer bytes |
+| `TURN_BUDGET_HARD_LIMIT_BYTES` | Required: positive integer, strictly greater than soft limit |
+| `TURN_BUDGET_POLL_SECONDS` | 30; range 1–3600 |
+| `TURN_BUDGET_STALE_SECONDS` | 300; range 1–86400, greater than polling interval |
+| `TURN_BUDGET_BILLING_ANCHOR` | Required: RFC3339 timestamp with whole seconds |
+| `TURN_BUDGET_PERIOD_SECONDS` | Unset: calendar months; optional fixed cycle length 60–31622400 seconds |
+| `TURN_BUDGET_REGISTRY_PATH` | Required: writable durable file, e.g. `/var/lib/puzzella-turn/registry.jsonl` |
+
+Missing/invalid settings reject startup before the listener binds. Budget settings
+without an enable flag also reject startup; explicit `false` ignores retained
+budget settings and restores the existing TURN behavior without storage or
+Analytics access. Disabling the guard deliberately removes budget protection.
+
+Normal issues and rotates credentials as before. At `usage >= soft limit`,
+SoftLimited stops new credentials and rotation, retaining previously distributed
+valid credentials and allocations. At `usage >= hard limit`, HardLimited closes
+issuance first, then revokes every tracked unexpired username. Existing sessions
+whose Welcome carried TURN receive `turn_unavailable`; rooms and signaling stay
+open. Direct ICE/STUN configuration is unchanged. Revoking a relay credential can
+interrupt a route using that relay; this server never explicitly disconnects a
+gameplay connection. Revoke failures retain registry entries and retry; they do
+not prevent other credentials from being revoked.
+
+The query filters `callsTurnUsageAdaptiveGroups` by the configured key and the
+half-open UTC range `[period start, observation time)`, requesting only
+`sum { egressBytes }` and no dimensions. Cloudflare aggregates the entire range
+into one group (`limit: 1`); the server does not download/sum a timeseries.
+Usage is `max(previous, latest)` within a period. Soft/Hard states and the observed
+high-water usage persist across restart and never decrease within that period.
+Analytics can lag and use adaptive sampling; polling and revocation are not an
+exact spending cap. Leave headroom below your actual cost ceiling. See
+[Cloudflare's sampling guidance](https://developers.cloudflare.com/realtime/turn/replacing-existing/#how-to-bill-end-users-for-their-turn-usage).
+
+Before admission starts, the server performs one Analytics query (five-second
+deadline). A failed initial query leaves issuance stopped. Later transient query
+failures preserve the last valid observation; after the stale timeout, issuance
+and rotation stop without revoking previously distributed credentials. Staleness
+is separate from the latched Soft/Hard state. A successful observation clears
+staleness, allowing issuance only if the period is still Normal. HTTP/query errors
+and malformed/partial responses do not become zero usage or force HardLimited.
+
+Set the anchor to your account's actual billing date/time. For example,
+`2026-01-17T12:00:00Z` uses the 17th at 12:00 UTC each calendar month, rather than
+the first. Offsets are normalized to UTC. An anchor on the 31st clamps to February's
+last day, then uses the 31st again in March. Set `TURN_BUDGET_PERIOD_SECONDS=2592000`
+only if your billing cycle actually uses fixed 30-day intervals from the anchor.
+Confirm the schedule against your account's invoices;
+[Cloudflare billing cycles](https://developers.cloudflare.com/billing/understand/how-billing-works/#billing-cycles)
+use UTC. Boundary calculation is isolated and tested. When the next period starts,
+usage/state/staleness reset; issuance remains stopped until a successful query
+for that new period. Responses for the previous period are discarded. Clock
+rollback does not reset a previously recorded newer period.
+
+The registry stores deduplicated usernames, conservative expiry timestamps and
+pending revoke flags, never passwords. It also stores budget/period metadata.
+Writes are appended and synced before credentials become publishable. Every
+512 writes a synced temporary checkpoint replaces the journal atomically in the
+same directory. Startup restores it, removes expired entries and truncates only
+an unfinished final journal record; complete malformed records reject startup.
+A sidecar `.lock` file holds an OS file lock across replacements: use one server
+process per registry. Account/key/anchor/cycle changes reject an existing registry;
+drain/revoke old credentials before switching configuration or storage. Keep the
+registry directory private and on a local filesystem with working file locking,
+atomic replacement and flush semantics. Do not delete it between restarts.
+
+The journal has a 256 MiB startup/append bound and a 250,000-entry bound with
+headroom for admitted in-flight requests. Capacity/storage errors stop issuance
+and leave Direct ICE/signaling available; successful storage recovery resumes
+issuance only when Analytics and budget state permit it. Expired entries are
+removed at startup and during maintenance. Revoke work uses one worker, batches
+of at most 32, up to four parallel HTTP calls, three-second deadlines and bounded
+exponential retry delays (2–300 seconds). Old-period revoke obligations survive
+a billing-period reset. No credential username, password or token is logged.
+
+For Docker, mount a writable persistent directory at the registry path and make
+it owned by UID/GID 10001; the rest of the filesystem may remain read-only. Add
+`--mount type=bind,src=/srv/puzzella-turn,dst=/var/lib/puzzella-turn` and set the
+registry path to `/var/lib/puzzella-turn/registry.jsonl` in the environment file.
+Back up this directory along with its configuration. A process crash/network
+timeout after Cloudflare minted a credential but before its response was received
+cannot reveal that unknown username locally; no such credential is sent to the
+client, and it expires under the configured TTL.
+
+Normal tests use mock Analytics/providers and loopback HTTP/WSS. They cover limit
+latching, stale recovery, anchored boundaries, restart/cleanup/deduplication,
+issuance and publication races, bounded revoke retry/concurrency and continued
+room/signaling operation after hard unavailability. Live Analytics/revoke and
+real relay disruption require separate account/network validation.
+
+Local budget verification on 2026-10-06 (Windows): fmt, all-target Clippy with
+warnings denied, locked build and 76 automated tests passed. The existing live
+Cloudflare issuance and real-Caddy tests remained ignored. No production Analytics
+or revoke API was called by this verification.
+
 ## Optional Cloudflare Realtime TURN
 
 Create a TURN key and API token using Cloudflare's
@@ -287,8 +399,11 @@ default expiry and disables TURN in listener/future outgoing defaults so a new
 peer does not attempt an allocation with expired credentials. Existing routes
 retain their original configuration. The initial endpoint set stays fixed, and
 recovery re-enables future TURN when a fresh credential with that set arrives.
-An unavailable event received before the latest default expires is ignored;
-it is not a gameplay disconnect.
+Budget-aware clients must honor `turn_unavailable` even before the latest default
+expires: a hard budget can revoke it early. Older Puzzella clients that ignore
+early unavailability retain unusable cached TURN defaults until expiry; update
+those clients before enabling the hard budget. The event never requests a
+gameplay disconnect or removal of Direct ICE/STUN configuration.
 
 Only `turn:host:port?transport=udp` entries are distributed (normally UDP ports 3478
 and 443). TCP/TLS entries are filtered out and credentials stay paired with their
@@ -296,7 +411,10 @@ own server entries. Native ICE retains its host/reflexive preference over relay.
 TURN allocations may be gathered alongside direct candidates, but gameplay uses
 relay only when the selected route requires it.
 
-WSS control loss cancels issuance/rotation for that socket. Existing GNS,
+WSS control loss cancels rotation for that socket. When a budget is enabled,
+already-started issuance finishes registry bookkeeping in a task holding the
+original concurrency permit, so cancellation cannot lose known credentials.
+Existing GNS,
 SecureTransport, SPAKE2, Sync/Ready and gameplay state continue independently.
 An existing TURN-only route can fail when its original credential expires, even
 if newer defaults keep arriving over WSS. Choose a TTL for the expected peer

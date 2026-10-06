@@ -192,15 +192,22 @@ async fn session(
     } else {
         None
     };
-    server.transition(|state| {
-        let mut effects = state.welcome(lease.id);
-        for delivery in &mut effects.deliveries {
-            if let ServerMessage::Welcome { turn, .. } = &mut delivery.message {
-                *turn = initial.clone();
+    let welcome = |initial: Option<protocol::TurnCredentials>| {
+        server.transition(|state| {
+            let mut effects = state.welcome(lease.id);
+            for delivery in &mut effects.deliveries {
+                if let ServerMessage::Welcome { turn, .. } = &mut delivery.message {
+                    *turn = initial.clone();
+                }
             }
-        }
-        effects
-    });
+            effects
+        });
+        initial
+    };
+    let initial = match (&server.turn, initial) {
+        (Some(service), Some(turn)) => service.publish(turn, welcome).await,
+        (_, initial) => welcome(initial),
+    };
     // Welcome fixes this control session's relay topology before peer ICE starts.
     // Native ICE cannot add TURN to an already initialized direct-only session.
     let _rotation = server.turn.clone().zip(initial).map(|(service, initial)| {
