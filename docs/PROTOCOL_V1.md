@@ -15,7 +15,7 @@ messages are each bounded at 24 KiB. WS Ping/Pong is outside the JSON schema.
 | RoomId | CSPRNG 128-bit room identity; issued only by server |
 | RoomCode | Ten Crockford Base32 characters; CSPRNG 50 bits, ASCII case normalized to upper, no I/L/O/U aliases |
 | MemberId | CSPRNG 128-bit anonymous member identity; issued only by server |
-| PeerId | Existing GNS/Puzzella 128-bit process routing label; bound to the current WebSocket membership |
+| PeerId | Existing GNS/Jigsall 128-bit process routing label; bound to the current WebSocket membership |
 | JoinId | CSPRNG 128-bit pending authorization transaction; host ACK/Reject only |
 
 IDs are non-nil lowercase hyphenated UUID-shaped strings; noncanonical spellings
@@ -114,7 +114,7 @@ peer_joined(peer_id, member_id), peer_unavailable(peer_id),
 signal(from_peer_id, payload_base64), room_closed(), error(code).
 
 Signal payloads use **canonical padded RFC 4648 standard Base64**, decoded length
-**1..=16,384 bytes**, exactly matching Puzzella MAX_SIGNAL_BYTES. Maximum Base64
+**1..=16,384 bytes**, exactly matching Jigsall MAX_SIGNAL_BYTES. Maximum Base64
 length is 21,848 bytes; decoded validation also rejects a 16,385-byte value that
 has the same encoded length. Server decodes only to validate size/encoding, relays
 the original canonical string, and never parses or logs GNS payloads.

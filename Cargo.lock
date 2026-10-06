@@ -859,7 +859,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "puzzella-rendezvous"
+name = "jigsall-rendezvous"
 version = "0.1.0"
 dependencies = [
  "axum",

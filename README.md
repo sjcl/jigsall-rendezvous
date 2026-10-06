@@ -1,6 +1,6 @@
-# puzzella-rendezvous
+# jigsall-rendezvous
 
-Async Rust (axum + Tokio) rendezvous/signaling v1 for Puzzella's custom GNS
+Async Rust (axum + Tokio) rendezvous/signaling v1 for Jigsall's custom GNS
 signaling. Hosts create a room; participants join with a ten-character room code.
 Only host–participant signaling is relayed. GNS native ICE establishes game P2P
 connections separately. Optional Cloudflare Realtime TURN supplies UDP relay
@@ -15,7 +15,7 @@ control sessions. Budget monitoring requires a small persistent registry volume.
 
 This server carries **no gameplay traffic** and accepts **no puzzle password,
 password hash, PAKE scalar, image hash, snapshot, or gameplay authentication**.
-A room code is a routing locator, not an authentication secret. Existing Puzzella
+A room code is a routing locator, not an authentication secret. Existing Jigsall
 SPAKE2 + SecureTransport remains responsible for password authentication and
 subsequent player assignment, Sync and Ready.
 
@@ -27,8 +27,11 @@ Rust 1.95 or newer:
 cargo run --locked --release
 ```
 
-The default listener is `127.0.0.1:8080`. Set `PUZZELLA_RENDEZVOUS_LISTEN` to a
+The default listener is `127.0.0.1:8080`. Set `JIGSALL_RENDEZVOUS_LISTEN` to a
 numeric socket address (`127.0.0.1:9000`, `[::1]:9000`, etc.).
+Server configuration uses only the `JIGSALL_RENDEZVOUS_` prefix; previous
+environment variable names are ignored. Update service environment files and
+container configuration when deploying this version.
 `GET /healthz` returns HTTP 200 without external dependencies.
 `GET /v1/ws` upgrades to the JSON WebSocket protocol described in
 [PROTOCOL_V1.md](docs/PROTOCOL_V1.md).
@@ -36,7 +39,7 @@ numeric socket address (`127.0.0.1:9000`, `[::1]:9000`, etc.).
 ## Docker
 
 ```sh
-docker build --pull -t puzzella-rendezvous:local .
+docker build --pull -t jigsall-rendezvous:local .
 ```
 
 The multi-stage [Dockerfile](Dockerfile) builds with Rust 1.95 and runs only the
@@ -49,18 +52,18 @@ for private networking and trusted-proxy settings.
 ## Internet deployment and trust
 
 ```text
-Client -- WSS --> reverse proxy -- localhost WS --> puzzella-rendezvous
+Client -- WSS --> reverse proxy -- localhost WS --> jigsall-rendezvous
 ```
 
 Terminate TLS with a correctly configured reverse proxy and a valid certificate;
-keep the backend listener private. The Puzzella production adapter accepts only
+keep the backend listener private. The Jigsall production adapter accepts only
 `wss://`, verifies certificates with WebPKI roots, and has no verification bypass.
 Its explicit local test constructor accepts `ws://` only for literal loopback IPs.
 Route bindings are trusted only because they arrive on this authenticated server
 channel. They certify anonymous membership, never the game password.
 
 By default the server uses the **TCP peer IP** and ignores forwarding headers.
-For a reverse proxy, set `PUZZELLA_RENDEZVOUS_TRUSTED_PROXIES` to a comma-separated
+For a reverse proxy, set `JIGSALL_RENDEZVOUS_TRUSTED_PROXIES` to a comma-separated
 list of explicit proxy CIDRs, e.g. `127.0.0.1/32,::1/128`. Only connections from
 those addresses use `X-Forwarded-For` for all IP connection/admission/room-attempt
 guards. Read [deployment and configuration](docs/DEPLOYMENT.md) for validation,
@@ -158,7 +161,7 @@ for validation and are never interpreted as GNS/game messages.
 
 ## Logging and shutdown
 
-`PUZZELLA_RENDEZVOUS_LOG` sets the application's logging level (default `info`).
+`JIGSALL_RENDEZVOUS_LOG` sets the application's logging level (default `info`).
 Only this server's target is enabled; `RUST_LOG` does not enable dependency frame
 logs. Logs contain startup/listener/shutdown events, never signal payloads,
 secrets, room codes or member identities.
@@ -170,7 +173,7 @@ delivery is best effort when a peer is slow or already gone. Clients retain
 established GNS routes independently.
 
 This server is **not STUN/TURN**. STUN endpoints and public candidates are supplied
-through Puzzella `IceConfig`; no third-party STUN endpoint is embedded. TURN relay
+through Jigsall `IceConfig`; no third-party STUN endpoint is embedded. TURN relay
 hosting, accounts, matchmaking, public browsing, room persistence and UI/runtime room
 integration remain outside v1.
 
@@ -193,9 +196,9 @@ byte saturation and reservation release. Real WebSocket tests check trusted and
 untrusted headers and admit a full 64-remote room through one loopback proxy IP.
 Both repositories parse and round-trip the same
 [golden messages](tests/fixtures/protocol_v1.jsonl). Update schema, these fixtures
-and the Puzzella copy together.
+and the Jigsall copy together.
 
-The Puzzella repository's `docs/RENDEZVOUS_V1.md` documents a two-process test
+The Jigsall repository's `docs/RENDEZVOUS_V1.md` documents a two-process test
 against this real binary, including native ICE, SPAKE2, encrypted lanes, and
 continued gameplay transport after control WebSocket shutdown. No other checkout
 or external network is required by this repository's CI.
