@@ -447,3 +447,17 @@ remaining direct-only after mock API recovery. This uses loopback WS and a local
 UDP relay, with no production API requests. Fixture keys are static and provider
 metadata TTLs are accelerated; this does not validate actual credential expiry,
 48-hour sessions or ICE restart recovery.
+
+## Bounded prefix history
+
+After resolving TrustedProxies against full IP addresses, admission groups IPv4
+as /32 and IPv6 as /64; mapped IPv4 uses the IPv4 key. Proxy trust and communication
+addresses are never prefix-truncated. NAT/shared-prefix clients share guards.
+The 4,096-entry table pins active connection counts. Inactive histories expire
+at five minutes; when full, inactive LRU entries move into 512 fixed, process-keyed
+conservative overflow slots. Returning sources inherit outstanding admission and
+room-attempt windows, so churn does not reset limits. Overflow collisions can
+cause temporary extra rate limiting under heavy multi-prefix churn, but empty
+history alone no longer permanently excludes unseen prefixes. All-active table,
+connection, room and outbound capacity saturation still rejects new work.
+Distributed sources and TCP/edge capacity need deployment-level limits.

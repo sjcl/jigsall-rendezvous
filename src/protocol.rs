@@ -50,6 +50,7 @@ id!(RoomId);
 id!(MemberId);
 id!(PeerId);
 id!(JoinId);
+id!(AbuseKey);
 
 pub const CODE_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
@@ -209,12 +210,14 @@ pub enum ServerMessage {
         join_id: JoinId,
         peer_id: PeerId,
         member_id: MemberId,
+        abuse_key: AbuseKey,
     },
     RoomJoined {
         room_id: RoomId,
         self_member_id: MemberId,
         host_peer_id: PeerId,
         host_member_id: MemberId,
+        host_abuse_key: AbuseKey,
     },
     PeerJoined {
         peer_id: PeerId,
@@ -305,6 +308,18 @@ fn parse<M: serde::de::DeserializeOwned>(text: &str) -> Result<M, ErrorCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn abuse_keys_are_required_server_fields_and_cannot_be_supplied_by_joiners() {
+        let join = r#"{"v":1,"type":"join_room","room_code":"ABCDEFGHJK","peer_id":"55555555-5555-4555-8555-555555555555","abuse_key":"77777777-7777-4777-8777-777777777777"}"#;
+        assert_eq!(parse_client(join), Err(ErrorCode::InvalidMessage));
+        let missing = r#"{"v":1,"type":"authorize_peer","join_id":"66666666-6666-4666-8666-666666666666","peer_id":"55555555-5555-4555-8555-555555555555","member_id":"77777777-7777-4777-8777-777777777777"}"#;
+        assert_eq!(parse_server(missing), Err(ErrorCode::InvalidMessage));
+        let valid = missing.replace(
+            '}',
+            ",\"abuse_key\":\"88888888-8888-4888-8888-888888888888\"}",
+        );
+        assert!(parse_server(&valid).is_ok());
+    }
     #[test]
     fn authorization_rejection_requires_only_exact_join_identity() {
         let valid =

@@ -1,11 +1,15 @@
 use crate::outbound;
 use crate::protocol::*;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use std::{
-    collections::HashMap,
+    collections::{hash_map::RandomState, HashMap},
+    hash::BuildHasher,
     net::IpAddr,
     time::{Duration, Instant},
 };
 use tokio::sync::watch;
+use zeroize::Zeroizing;
 
 #[derive(Clone, Debug)]
 pub struct Limits {
@@ -100,6 +104,7 @@ impl Limits {
         Ok(())
     }
 }
+#[derive(Clone)]
 pub(crate) struct Window {
     started: Instant,
     count: u32,
@@ -127,6 +132,7 @@ impl Window {
         true
     }
 }
+#[derive(Clone)]
 struct IpHistory {
     connections: usize,
     touched: Instant,
@@ -194,6 +200,9 @@ pub(crate) struct State {
     codes: HashMap<RoomCode, RoomId>,
     peers: HashMap<PeerId, u64>,
     ips: HashMap<IpAddr, IpHistory>,
+    overflow: Vec<Option<IpHistory>>,
+    history_hash: RandomState,
+    abuse_secret: Zeroizing<[u8; 32]>,
     pending: usize,
 }
 fn random() -> [u8; 16] {
@@ -202,6 +211,8 @@ fn random() -> [u8; 16] {
 impl State {
     pub fn new(limits: Limits) -> Self {
         limits.validate().expect("invalid rendezvous limits");
+        let mut abuse_secret = Zeroizing::new([0; 32]);
+        getrandom::fill(&mut *abuse_secret).expect("OS random source unavailable");
         Self {
             authority: AuthorityId(random()),
             limits,
@@ -212,6 +223,9 @@ impl State {
             codes: HashMap::new(),
             peers: HashMap::new(),
             ips: HashMap::new(),
+            overflow: (0..512).map(|_| None).collect(),
+            history_hash: RandomState::new(),
+            abuse_secret,
             pending: 0,
         }
     }
@@ -222,26 +236,52 @@ impl State {
         cancel: watch::Sender<bool>,
         now: Instant,
     ) -> Result<u64, ErrorCode> {
+        // The caller has resolved TrustedProxies against the full source IP.
+        let ip = crate::proxy::prefix(ip);
         self.prune_ips(now);
         if self.stopping || self.connections.len() >= self.limits.connections {
             return Err(ErrorCode::Capacity);
         }
         if !self.ips.contains_key(&ip) && self.ips.len() >= self.limits.ip_history {
-            return Err(ErrorCode::Capacity);
+            let victim = self
+                .ips
+                .iter()
+                .filter(|(_, h)| h.connections == 0)
+                .min_by_key(|(_, h)| h.touched)
+                .map(|(&ip, _)| ip)
+                .ok_or(ErrorCode::Capacity)?;
+            let mut retired = self.ips.remove(&victim).expect("inactive history");
+            let slot = self.history_slot(victim);
+            if let Some(old) = self.overflow[slot]
+                .take()
+                .filter(|h| Self::history_live(h, now))
+            {
+                Self::merge_windows(&mut retired.admission, old.admission, now);
+                Self::merge_windows(&mut retired.attempts, old.attempts, now);
+                retired.touched = retired.touched.max(old.touched);
+            }
+            self.overflow[slot] = Some(retired);
         }
-        let history = self.ips.entry(ip).or_insert_with(|| IpHistory {
-            connections: 0,
-            touched: now,
-            admission: Window::new(
-                self.limits.admissions_per_ip_per_minute,
-                Duration::from_secs(60),
-                now,
-            ),
-            attempts: Window::new(
-                self.limits.room_attempts_per_ip_per_minute,
-                Duration::from_secs(60),
-                now,
-            ),
+        let slot = self.history_slot(ip);
+        let inherited = self.overflow[slot]
+            .as_ref()
+            .filter(|h| Self::history_live(h, now))
+            .cloned();
+        let history = self.ips.entry(ip).or_insert_with(|| {
+            inherited.unwrap_or_else(|| IpHistory {
+                connections: 0,
+                touched: now,
+                admission: Window::new(
+                    self.limits.admissions_per_ip_per_minute,
+                    Duration::from_secs(60),
+                    now,
+                ),
+                attempts: Window::new(
+                    self.limits.room_attempts_per_ip_per_minute,
+                    Duration::from_secs(60),
+                    now,
+                ),
+            })
         });
         history.touched = now;
         if history.connections >= self.limits.connections_per_ip || !history.admission.take(now) {
@@ -265,6 +305,42 @@ impl State {
             },
         );
         Ok(id)
+    }
+    fn history_slot(&self, ip: IpAddr) -> usize {
+        self.history_hash.hash_one(ip) as usize % self.overflow.len()
+    }
+    fn history_live(h: &IpHistory, now: Instant) -> bool {
+        now.saturating_duration_since(h.touched) < Duration::from_secs(300)
+    }
+    fn merge_windows(a: &mut Window, mut b: Window, now: Instant) {
+        for w in [&mut *a, &mut b] {
+            if now.saturating_duration_since(w.started) >= w.period {
+                w.started = now;
+                w.count = 0;
+            }
+        }
+        a.count = a.count.max(b.count);
+        a.started = a.started.max(b.started);
+    }
+    fn abuse_key(&self, room: RoomId, ip: IpAddr) -> AbuseKey {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&*self.abuse_secret).expect("HMAC key length");
+        mac.update(b"jigsall-rendezvous-abuse-v1\0");
+        mac.update(&room.0);
+        match crate::proxy::prefix(ip) {
+            IpAddr::V4(ip) => {
+                mac.update(&[4]);
+                mac.update(&ip.octets());
+            }
+            IpAddr::V6(ip) => {
+                mac.update(&[6]);
+                mac.update(&ip.octets()[..8]);
+            }
+        }
+        AbuseKey(
+            mac.finalize().into_bytes()[..16]
+                .try_into()
+                .expect("128-bit key"),
+        )
     }
     fn emit(&self, effects: &mut Effects, target: u64, message: ServerMessage) {
         if let Some(c) = self.connections.get(&target) {
@@ -418,6 +494,7 @@ impl State {
     ) -> Result<Effects, ErrorCode> {
         self.vacant(id, peer)?;
         let room_id = *self.codes.get(&code).ok_or(ErrorCode::UnknownRoom)?;
+        let abuse_key = self.abuse_key(room_id, self.connections[&id].ip);
         let room = self.rooms.get_mut(&room_id).unwrap();
         if room.members.len() + room.pending.len() >= self.limits.participants {
             return Err(ErrorCode::RoomFull);
@@ -453,6 +530,7 @@ impl State {
                 join_id: join,
                 peer_id: peer,
                 member_id: member.member,
+                abuse_key,
             },
         );
         Ok(e)
@@ -475,6 +553,7 @@ impl State {
             .get_mut(&member.connection)
             .unwrap()
             .membership = Some(Membership::Routed(room_id));
+        let host_abuse_key = self.abuse_key(room_id, self.connections[&host.connection].ip);
         let mut e = Effects::default();
         // This ordering is a protocol contract. Server::transition serializes
         // the state commit and both enqueues against every competing relay.
@@ -494,6 +573,7 @@ impl State {
                 self_member_id: member.member,
                 host_peer_id: host.peer,
                 host_member_id: host.member,
+                host_abuse_key,
             },
         );
         e.deliveries.last_mut().unwrap().requires = Some(id);

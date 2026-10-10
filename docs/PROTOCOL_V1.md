@@ -24,16 +24,25 @@ version/variant bits; all nonzero 16-byte values have the same canonical encodin
 Clients never mint RoomId, MemberId, AuthorityId or a signal sender identity.
 Only the host echoes a server-issued MemberId in ConfirmPeer/RevokePeer.
 Room code is not a game authentication credential. MemberId has no account/Sybil
-guarantee; future account authentication can replace its use as RouteOrigin.account
-in an explicitly versioned extension. Current routing key is
-`RouteOrigin(authority_id, room_id, remote_member_id)`.
+guarantee. MemberId remains the routing incarnation and signaling-queue identity.
+A required server-issued AbuseKey separately identifies authentication/connection
+abuse. AuthorizePeer carries the joining source's key; RoomJoined carries the
+host's key. Keys are 128-bit opaque values encoded in the same canonical UUID
+syntax as other IDs, not UUID-v4 membership identities. The server computes
+Truncate128(HMAC-SHA256(startup_secret, "jigsall-rendezvous-abuse-v1\0" || RoomId
+|| prefix_family || prefix_bytes)), using /32 IPv4 or /64 IPv6 after trusted-proxy
+source validation and mapped-IPv4 normalization. Different rooms/prefixes have
+different keys; reconnects within one room/prefix keep the key. The startup secret
+is OS-random, zeroized on drop, memory-only, and rotates on restart. Clients
+cannot supply keys; missing required fields are invalid. No raw source IP/prefix
+or gameplay authentication secret is sent to the host/server respectively.
 
 ## Handshake and topology
 
 1. Server sends Welcome on an admitted WebSocket.
 2. Host sends CreateRoom(peer_id); server binds it and returns RoomCreated.
 3. Joiner sends JoinRoom(room_code, peer_id). The server reserves a participant
-   slot and emits AuthorizePeer(join_id, peer_id, member_id) **only to the host**.
+   slot and emits AuthorizePeer(join_id, peer_id, member_id, abuse_key) **only to the host**.
 4. Host adapter verifies its current room/authority, calls authorize_peer, then
    sends AuthorizeAck(join_id). ACK must originate from this room's host before
    the fixed 12-second deadline. A duplicate/stale/foreign ACK returns
@@ -108,8 +117,8 @@ room. Duplicate PeerIds are rejected across live/pending memberships. LeaveRoom
 ends this control connection; create/join again requires a new connection.
 
 Server: welcome(authority_id), room_created(room_id, room_code, self_member_id),
-authorize_peer(join_id, peer_id, member_id),
-room_joined(room_id, self_member_id, host_peer_id, host_member_id),
+authorize_peer(join_id, peer_id, member_id, abuse_key),
+room_joined(room_id, self_member_id, host_peer_id, host_member_id, host_abuse_key),
 peer_joined(peer_id, member_id), peer_unavailable(peer_id),
 signal(from_peer_id, payload_base64), room_closed(), error(code).
 
@@ -175,7 +184,7 @@ schema and fixtures must be updated together. Field order has no semantic meanin
 ```
 
 ```json
-{"v":1,"type":"authorize_peer","join_id":"66666666-6666-4666-8666-666666666666","peer_id":"55555555-5555-4555-8555-555555555555","member_id":"77777777-7777-4777-8777-777777777777"}
+{"v":1,"type":"authorize_peer","join_id":"66666666-6666-4666-8666-666666666666","peer_id":"55555555-5555-4555-8555-555555555555","member_id":"77777777-7777-4777-8777-777777777777","abuse_key":"77777777-7777-4777-8777-777777777777"}
 ```
 
 ```json
@@ -187,7 +196,7 @@ schema and fixtures must be updated together. Field order has no semantic meanin
 ```
 
 ```json
-{"v":1,"type":"room_joined","room_id":"33333333-3333-4333-8333-333333333333","self_member_id":"77777777-7777-4777-8777-777777777777","host_peer_id":"22222222-2222-4222-8222-222222222222","host_member_id":"44444444-4444-4444-8444-444444444444"}
+{"v":1,"type":"room_joined","room_id":"33333333-3333-4333-8333-333333333333","self_member_id":"77777777-7777-4777-8777-777777777777","host_peer_id":"22222222-2222-4222-8222-222222222222","host_member_id":"44444444-4444-4444-8444-444444444444","host_abuse_key":"44444444-4444-4444-8444-444444444444"}
 ```
 
 ```json

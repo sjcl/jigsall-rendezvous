@@ -105,8 +105,10 @@ v1 extension requires updating the game and server together.
 
 MemberId is a **server-issued anonymous room membership**, not a Steam account
 or Sybil-proof user identity. New connections can obtain new memberships;
-server-side connection, IP, attempt and message limits complement client route
-limits. A future authenticated-account extension must explicitly change the
+server-side connection, IP-prefix, attempt and message limits complement client
+route limits. A separate server-issued, room-scoped AbuseKey stays stable across
+rejoins from the same verified IPv4 /32 or IPv6 /64. It reveals no source IP to
+the host; MemberId continues to identify independent signaling queues. A future authenticated-account extension must explicitly change the
 binding contract.
 
 Member control disconnection removes its routing membership and sends
@@ -125,7 +127,7 @@ environment settings for capacities, IP guards and outbound byte budgets;
 
 | Resource | Limit |
 | --- | --- |
-| WebSocket reservations/connections | 1,024 global, 64 per resolved source IP |
+| WebSocket reservations/connections | 1,024 global, 64 per resolved source prefix (/32 IPv4, /64 IPv6) |
 | Rooms | 256 |
 | Remote participants, including pending joins | 64 per room |
 | Pending joins before host ACK | 512 global, within room participant limit |
@@ -138,7 +140,7 @@ environment settings for capacities, IP guards and outbound byte budgets;
 | New connection attempts | 60/minute per IP |
 | Outbound WebSocket queue | 128 messages and 256 KiB per connection; 32 MiB global |
 | WebSocket read / write buffers | 24 KiB / 48 KiB maximum write buffer |
-| IP history | 4,096 entries, retained 5 minutes after use; never evict active IPs |
+| IP history | 4,096 exact entries + 512 conservative overflow slots; inactive TTL/LRU, active counts pinned |
 | Pre-room idle / pending join | Fixed 30 / 12 seconds |
 | Routed member awaiting host game-auth confirmation | Fixed 30 seconds after ACK |
 | Ping interval / matching-Pong deadline | 15 / 15 seconds |

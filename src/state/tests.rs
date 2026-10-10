@@ -302,15 +302,17 @@ fn rates_global_caps_and_bounded_ip_history() {
     h.state.disconnect(a, &mut e, h.now);
     let (tx, _) = h.queue();
     let (cancel, _) = watch::channel(false);
-    assert_eq!(
-        h.state.admit(
+    let new = h
+        .state
+        .admit(
             IpAddr::from([127, 0, 0, 3]),
             tx.clone(),
             cancel.clone(),
-            h.now
-        ),
-        Err(ErrorCode::Capacity)
-    );
+            h.now,
+        )
+        .unwrap();
+    assert_eq!(h.state.ips.len(), 2);
+    h.state.disconnect(new, &mut Effects::default(), h.now);
     assert_eq!(
         h.state
             .admit(IpAddr::from([127, 0, 0, 1]), tx, cancel, h.now),
