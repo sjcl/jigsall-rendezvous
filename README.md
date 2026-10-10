@@ -140,7 +140,7 @@ environment settings for capacities, IP guards and outbound byte budgets;
 | New connection attempts | 60/minute per IP |
 | Outbound WebSocket queue | 128 messages and 256 KiB per connection; 32 MiB global |
 | WebSocket read / write buffers | 24 KiB / 48 KiB maximum write buffer |
-| IP history | 4,096 exact entries + 512 conservative overflow slots; inactive TTL/LRU, active counts pinned |
+| IP history | 4,096 primary + 512 exact-owner retired entries; active counts/debt protected, bounded miss-only budgets |
 | Pre-room idle / pending join | Fixed 30 / 12 seconds |
 | Routed member awaiting host game-auth confirmation | Fixed 30 seconds after ACK |
 | Ping interval / matching-Pong deadline | 15 / 15 seconds |

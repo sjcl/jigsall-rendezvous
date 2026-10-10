@@ -132,12 +132,48 @@ impl Window {
         true
     }
 }
+const RETIRED_IPS: usize = 512;
+const IP_WINDOW: Duration = Duration::from_secs(60);
+const IP_HISTORY_TTL: Duration = Duration::from_secs(300);
+// The policy is common to all IPs; omit duplicated limit/period fields so
+// exact ownership fits within the previous compressed-history allocation.
+#[derive(Clone)]
+struct HistoryWindow {
+    started: Instant,
+    count: u32,
+}
+impl HistoryWindow {
+    fn take(&mut self, limit: u32, now: Instant) -> bool {
+        if now.saturating_duration_since(self.started) >= IP_WINDOW {
+            self.started = now;
+            self.count = 0;
+        }
+        if self.count >= limit {
+            return false;
+        }
+        self.count += 1;
+        true
+    }
+    fn spent(&self, now: Instant) -> bool {
+        self.count != 0 && now.saturating_duration_since(self.started) < IP_WINDOW
+    }
+}
 #[derive(Clone)]
 struct IpHistory {
     connections: usize,
     touched: Instant,
-    admission: Window,
-    attempts: Window,
+    admission: HistoryWindow,
+    attempts: HistoryWindow,
+}
+impl IpHistory {
+    fn reclaimable(&self, now: Instant) -> bool {
+        self.connections == 0 && !self.admission.spent(now) && !self.attempts.spent(now)
+    }
+}
+struct RetiredIp {
+    owner: IpAddr,
+    fingerprint: u64,
+    history: IpHistory,
 }
 #[derive(Clone, Copy)]
 enum Membership {
@@ -200,7 +236,11 @@ pub(crate) struct State {
     codes: HashMap<RoomCode, RoomId>,
     peers: HashMap<PeerId, u64>,
     ips: HashMap<IpAddr, IpHistory>,
-    overflow: Vec<Option<IpHistory>>,
+    retired: Vec<RetiredIp>,
+    untracked_admissions: Window,
+    untracked_attempts: Window,
+    #[cfg(test)]
+    collide: bool,
     history_hash: RandomState,
     abuse_secret: Zeroizing<[u8; 32]>,
     pending: usize,
@@ -223,7 +263,11 @@ impl State {
             codes: HashMap::new(),
             peers: HashMap::new(),
             ips: HashMap::new(),
-            overflow: (0..512).map(|_| None).collect(),
+            retired: Vec::with_capacity(RETIRED_IPS),
+            untracked_admissions: Window::new(32, Duration::from_secs(1), Instant::now()),
+            untracked_attempts: Window::new(32, Duration::from_secs(1), Instant::now()),
+            #[cfg(test)]
+            collide: false,
             history_hash: RandomState::new(),
             abuse_secret,
             pending: 0,
@@ -242,54 +286,39 @@ impl State {
         if self.stopping || self.connections.len() >= self.limits.connections {
             return Err(ErrorCode::Capacity);
         }
-        if !self.ips.contains_key(&ip) && self.ips.len() >= self.limits.ip_history {
-            let victim = self
-                .ips
-                .iter()
-                .filter(|(_, h)| h.connections == 0)
-                .min_by_key(|(_, h)| h.touched)
-                .map(|(&ip, _)| ip)
-                .ok_or(ErrorCode::Capacity)?;
-            let mut retired = self.ips.remove(&victim).expect("inactive history");
-            let slot = self.history_slot(victim);
-            if let Some(old) = self.overflow[slot]
-                .take()
-                .filter(|h| Self::history_live(h, now))
-            {
-                Self::merge_windows(&mut retired.admission, old.admission, now);
-                Self::merge_windows(&mut retired.attempts, old.attempts, now);
-                retired.touched = retired.touched.max(old.touched);
-            }
-            self.overflow[slot] = Some(retired);
-        }
-        let slot = self.history_slot(ip);
-        let inherited = self.overflow[slot]
-            .as_ref()
-            .filter(|h| Self::history_live(h, now))
-            .cloned();
-        let history = self.ips.entry(ip).or_insert_with(|| {
-            inherited.unwrap_or_else(|| IpHistory {
-                connections: 0,
-                touched: now,
-                admission: Window::new(
-                    self.limits.admissions_per_ip_per_minute,
-                    Duration::from_secs(60),
-                    now,
-                ),
-                attempts: Window::new(
-                    self.limits.room_attempts_per_ip_per_minute,
-                    Duration::from_secs(60),
-                    now,
-                ),
-            })
+        self.ensure_history(ip, now);
+        let fingerprint = self.fingerprint(ip);
+        let history = self.ips.get_mut(&ip).or_else(|| {
+            self.retired
+                .iter_mut()
+                .find(|r| r.fingerprint == fingerprint && r.owner == ip)
+                .map(|r| &mut r.history)
         });
-        history.touched = now;
-        if history.connections >= self.limits.connections_per_ip || !history.admission.take(now) {
-            return Err(ErrorCode::RateLimited);
+        if let Some(history) = history {
+            history.touched = now;
+            if history.connections >= self.limits.connections_per_ip
+                || !history
+                    .admission
+                    .take(self.limits.admissions_per_ip_per_minute, now)
+            {
+                return Err(ErrorCode::RateLimited);
+            }
+        } else {
+            // Only unrecorded prefixes share this budget. Connection ownership
+            // remains in the already bounded connection table, even without a
+            // retained rate window (including custom all-active small tables).
+            if self.connections.values().filter(|c| c.ip == ip).count()
+                >= self.limits.connections_per_ip
+                || !self.untracked_admissions.take(now)
+            {
+                return Err(ErrorCode::RateLimited);
+            }
         }
         let id = self.next;
         self.next = self.next.checked_add(1).ok_or(ErrorCode::Capacity)?;
-        history.connections += 1;
+        if let Some(history) = self.history_mut(ip) {
+            history.connections += 1;
+        }
         self.connections.insert(
             id,
             Connection {
@@ -306,21 +335,84 @@ impl State {
         );
         Ok(id)
     }
-    fn history_slot(&self, ip: IpAddr) -> usize {
-        self.history_hash.hash_one(ip) as usize % self.overflow.len()
+    fn fingerprint(&self, ip: IpAddr) -> u64 {
+        #[cfg(test)]
+        if self.collide {
+            return 0;
+        }
+        self.history_hash.hash_one(ip)
     }
-    fn history_live(h: &IpHistory, now: Instant) -> bool {
-        now.saturating_duration_since(h.touched) < Duration::from_secs(300)
+    fn history_mut(&mut self, ip: IpAddr) -> Option<&mut IpHistory> {
+        let fingerprint = self.fingerprint(ip);
+        self.ips.get_mut(&ip).or_else(|| {
+            self.retired
+                .iter_mut()
+                .find(|r| r.fingerprint == fingerprint && r.owner == ip)
+                .map(|r| &mut r.history)
+        })
     }
-    fn merge_windows(a: &mut Window, mut b: Window, now: Instant) {
-        for w in [&mut *a, &mut b] {
-            if now.saturating_duration_since(w.started) >= w.period {
-                w.started = now;
-                w.count = 0;
+    fn remember(&mut self, ip: IpAddr, history: IpHistory, now: Instant) -> Result<(), IpHistory> {
+        if self.retired.len() == RETIRED_IPS {
+            let victim = self
+                .retired
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.history.reclaimable(now))
+                .min_by_key(|(_, r)| r.history.touched)
+                .map(|(i, _)| i);
+            let Some(victim) = victim else {
+                return if history.reclaimable(now) {
+                    Ok(())
+                } else {
+                    Err(history)
+                };
+            };
+            self.retired.swap_remove(victim);
+        }
+        let fingerprint = self.fingerprint(ip);
+        self.retired.push(RetiredIp {
+            owner: ip,
+            fingerprint,
+            history,
+        });
+        Ok(())
+    }
+    fn ensure_history(&mut self, ip: IpAddr, now: Instant) {
+        if self.history_mut(ip).is_some() {
+            return;
+        }
+        let history = IpHistory {
+            connections: self.connections.values().filter(|c| c.ip == ip).count(),
+            touched: now,
+            admission: HistoryWindow {
+                started: now,
+                count: 0,
+            },
+            attempts: HistoryWindow {
+                started: now,
+                count: 0,
+            },
+        };
+        if self.ips.len() >= self.limits.ip_history {
+            let victim = self
+                .ips
+                .iter()
+                .filter(|(_, h)| h.connections == 0)
+                .min_by_key(|(_, h)| h.touched)
+                .map(|(&ip, _)| ip);
+            let Some(victim) = victim else {
+                // Keep active primary histories pinned; bounded exact overflow
+                // can also hold active prefixes when ip_history is configured small.
+                let _ = self.remember(ip, history, now);
+                return;
+            };
+            let old = self.ips.remove(&victim).unwrap();
+            if let Err(old) = self.remember(victim, old, now) {
+                self.ips.insert(victim, old);
+                return;
             }
         }
-        a.count = a.count.max(b.count);
-        a.started = a.started.max(b.started);
+        self.ips.insert(ip, history);
     }
     fn abuse_key(&self, room: RoomId, ip: IpAddr) -> AbuseKey {
         let mut mac = Hmac::<Sha256>::new_from_slice(&*self.abuse_secret).expect("HMAC key length");
@@ -383,9 +475,18 @@ impl State {
             message,
             ClientMessage::CreateRoom { .. } | ClientMessage::JoinRoom { .. }
         ) {
-            let ip = self.ips.get_mut(&c.ip).expect("admitted IP");
-            ip.touched = now;
-            if !c.attempts.take(now) || !ip.attempts.take(now) {
+            let source = c.ip;
+            if !c.attempts.take(now) {
+                return self.error(id, ErrorCode::RateLimited);
+            }
+            let limit = self.limits.room_attempts_per_ip_per_minute;
+            let allowed = if let Some(ip) = self.history_mut(source) {
+                ip.touched = now;
+                ip.attempts.take(limit, now)
+            } else {
+                self.untracked_attempts.take(now)
+            };
+            if !allowed {
                 return self.error(id, ErrorCode::RateLimited);
             }
         }
@@ -707,9 +808,10 @@ impl State {
             return;
         };
         e.cancel.push(c.cancel);
-        let ip = self.ips.get_mut(&c.ip).unwrap();
-        ip.connections -= 1;
-        ip.touched = now;
+        if let Some(ip) = self.history_mut(c.ip) {
+            ip.connections -= 1;
+            ip.touched = now;
+        }
         if let Some(peer) = c.peer {
             self.peers.remove(&peer);
         }
@@ -769,8 +871,11 @@ impl State {
     }
     fn prune_ips(&mut self, now: Instant) {
         self.ips.retain(|_, ip| {
-            ip.connections != 0
-                || now.saturating_duration_since(ip.touched) < Duration::from_secs(300)
+            ip.connections != 0 || now.saturating_duration_since(ip.touched) < IP_HISTORY_TTL
+        });
+        self.retired.retain(|r| {
+            r.history.connections != 0
+                || now.saturating_duration_since(r.history.touched) < IP_HISTORY_TTL
         });
     }
     pub fn sweep(&mut self, now: Instant) -> Effects {
