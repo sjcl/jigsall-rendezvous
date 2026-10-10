@@ -45,6 +45,13 @@ pub(crate) fn normalize(ip: IpAddr) -> IpAddr {
         _ => ip,
     }
 }
+/// Apply only after TrustedProxies::source verifies the full source address.
+pub(crate) fn prefix(ip: IpAddr) -> IpAddr {
+    match normalize(ip) {
+        IpAddr::V6(ip) => IpAddr::V6(std::net::Ipv6Addr::from(u128::from(ip) & (u128::MAX << 64))),
+        ip => ip,
+    }
+}
 impl TrustedProxies {
     fn contains(&self, ip: IpAddr) -> bool {
         self.0.iter().any(|net| net.contains(&normalize(ip)))

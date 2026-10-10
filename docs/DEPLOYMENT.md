@@ -447,3 +447,38 @@ remaining direct-only after mock API recovery. This uses loopback WS and a local
 UDP relay, with no production API requests. Fixture keys are static and provider
 metadata TTLs are accelerated; this does not validate actual credential expiry,
 48-hour sessions or ICE restart recovery.
+
+## Bounded prefix history
+
+After resolving TrustedProxies against full IP addresses, admission groups IPv4
+as /32 and IPv6 as /64; mapped IPv4 uses the IPv4 key. Proxy trust and communication
+addresses are never prefix-truncated. NAT/shared-prefix clients share guards.
+The 4,096-entry primary table and 512-entry exact-owner retired cache retain
+active connection counts and outstanding admission/room-attempt windows.
+Records expire after five inactive minutes; LRU replacement is allowed only
+when both minute windows have naturally expired (or are unused) and no
+connections remain. Hash fingerprints accelerate lookup, but full prefix
+equality is mandatory: a collision never transfers counts or consumed limits.
+The common minute-window policy is stored once, keeping exact owner metadata
+within the previous overflow allocation; all history structures remain bounded.
+
+When the primary table is full, inactive histories move to the retired cache.
+If every primary entry is active, new prefixes can use the retired cache too;
+its active counts are also pinned. If both tables cannot hold a new prefix,
+unrecorded admissions and create/join attempts each use a separate 32-per-second
+window. Known prefixes keep their own minute limits and bypass those fallback
+windows. The bounded connection table still enforces connections-per-prefix and
+per-connection request rates, and disconnect/cleanup works without an IP record.
+If an unrecorded prefix later obtains a record, its live connection count is
+reconstructed from the connection table.
+
+This keeps opportunities for new prefixes without treating another prefix's
+debt as theirs. Exact per-prefix minute histories cannot be promised beyond
+4,608 protected prefixes (or the smaller configured primary capacity + 512).
+A distributed flood can consume the miss-only windows, temporarily rate-limit
+unrecorded legitimate prefixes, or retry an unrecorded prefix faster than its
+ordinary minute limit. Its aggregate work remains capped, remembered prefixes
+are independent, and no history-capacity condition permanently refuses all
+new sources. Active connection, room and outbound capacity saturation still
+rejects work. NAT/shared prefixes share legitimate rate limits; distributed
+sources and TCP/edge capacity also need deployment-level limits.
