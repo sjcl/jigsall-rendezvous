@@ -16,7 +16,7 @@ getrandom = "0.4"
 hmac = "0.12"
 sha2 = "0.10"
 zeroize = "1.9"
-base64 = "0.22"
+base64 = "0.23"
 ipnet = "2.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
